@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any, Dict
 
+from hermes_constants import get_hermes_home
 from utils import env_var_enabled
 
 _DEFAULT_BROWSER_PROVIDER = "local"
@@ -14,8 +16,36 @@ _VALID_MODAL_MODES = {"auto", "direct", "managed"}
 
 
 def managed_nous_tools_enabled() -> bool:
-    """Return True when the hidden Nous-managed tools feature flag is enabled."""
-    return env_var_enabled("HERMES_ENABLE_NOUS_MANAGED_TOOLS")
+    """Return True when Nous Tool Gateway can be attempted.
+
+    v0.10 moved this from a hidden feature flag toward subscription-backed
+    availability. Keep the legacy flag as an override for existing local
+    workflows, but also enable managed routes when a Hermes-owned Nous token is
+    present. A dedicated disable flag gives users a predictable opt-out.
+    """
+    if env_var_enabled("HERMES_DISABLE_NOUS_MANAGED_TOOLS"):
+        return False
+    if env_var_enabled("HERMES_ENABLE_NOUS_MANAGED_TOOLS"):
+        return True
+    if os.getenv("TOOL_GATEWAY_USER_TOKEN", "").strip():
+        return True
+
+    try:
+        auth_path = get_hermes_home() / "auth.json"
+        if not auth_path.is_file():
+            return False
+        data = json.loads(auth_path.read_text())
+        providers = data.get("providers", {})
+        nous = providers.get("nous", {}) if isinstance(providers, dict) else {}
+        return bool(
+            isinstance(nous, dict)
+            and (
+                str(nous.get("access_token") or "").strip()
+                or str(nous.get("refresh_token") or "").strip()
+            )
+        )
+    except Exception:
+        return False
 
 
 def normalize_browser_cloud_provider(value: object | None) -> str:

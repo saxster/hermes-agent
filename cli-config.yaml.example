@@ -98,18 +98,18 @@ model:
 # if set, otherwise google/gemini-2.5-flash). Only the chairman uses the
 # stronger synthesis model, keeping cost overhead low (~1.5-2x a single call).
 #
-# council:
-#   enabled: true                    # Master toggle (default: false)
-#   default_depth: quick             # "quick" (3 reviewers) or "full" (5 + peer review)
-#   reviewer_model: null             # null → smart_model_routing.cheap_model
-#   chairman_model: null             # null → FALLBACK_CHAIRMAN_MODEL
-#   skip_for_trivial: true           # bypass for weather/time/calculator
-#   trivial_keywords:
-#     - weather
-#     - time
-#     - calculator
-#     - hello
-#     - thanks
+council:
+  enabled: true                    # Master toggle — matches Swift companion default-ON
+  default_depth: quick             # "quick" (3 reviewers) or "full" (5 + peer review)
+  reviewer_model: null             # null → smart_model_routing.cheap_model
+  chairman_model: null             # null → FALLBACK_CHAIRMAN_MODEL
+  skip_for_trivial: true           # bypass for weather/time/calculator
+  trivial_keywords:
+    - weather
+    - time
+    - calculator
+    - hello
+    - thanks
 #
 # Per-request overrides:
 #   - Gateway:  X-Hermes-Council: on|off  (HTTP header)
