@@ -4,6 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-agent"
+# Hardcoded for local / editable installs. Release tags override this at
+# build time via .github/workflows/release.yml — see the "Derive version
+# from tag" step for the PEP 440 normalization the release performs.
+# Rationale for not adopting setuptools-scm: the repo's tag history
+# mixes calver (`v2026.M.D`) with semver (`v0.10.0`), and setuptools-scm's
+# bump heuristics don't cleanly straddle both. A workflow-level injection
+# gives us PEP 440-clean release wheels without a migration.
 version = "0.10.0+hermes.local"
 description = "The self-improving AI agent — creates skills from experience, improves them during use, and runs anywhere"
 readme = "README.md"
