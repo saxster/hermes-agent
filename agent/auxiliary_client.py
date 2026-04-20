@@ -25,6 +25,8 @@ from agent.auxiliary.base import (  # noqa: F401,E402
     _DEFAULT_AUX_TIMEOUT,
     _OR_HEADERS,
     _build_call_kwargs,
+    _client_cache,
+    _client_cache_lock,
     _convert_content_for_responses,
     _current_custom_base_url,
     _force_close_async_httpx,
