@@ -28,7 +28,7 @@ import os
 import sqlite3
 import time
 import uuid
-from typing import Any, Dict, Final, List, Optional, TypedDict
+from typing import Any, Dict, Final, List, NotRequired, Optional, Required, TypedDict
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -99,8 +99,13 @@ MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
 CAPABILITIES_SCHEMA_VERSION: Final[int] = 2
 
 
-class ToolGatewayFeature(TypedDict, total=False):
-    """One row of `capabilities.tool_gateway.features`."""
+class ToolGatewayFeature(TypedDict):
+    """One row of `capabilities.tool_gateway.features`.
+
+    All keys are populated by `hermes_cli.nous_subscription.get_nous_subscription_features`
+    for every feature row. `current_provider` is the only field that can be
+    None (when no provider has been configured yet).
+    """
     key: str
     label: str
     available: bool
@@ -111,36 +116,53 @@ class ToolGatewayFeature(TypedDict, total=False):
     current_provider: Optional[str]
 
 
-class ToolGatewayBlock(TypedDict, total=False):
+class ToolGatewayBlock(TypedDict):
+    """`capabilities.tool_gateway` block. On probe failure the collector
+    falls back to `{"available": False, "features": []}` — both keys are
+    always present. `provider_is_nous` is only populated on the success
+    path, so it's NotRequired.
+    """
     available: bool
-    provider_is_nous: bool
     features: List[ToolGatewayFeature]
+    provider_is_nous: NotRequired[bool]
 
 
 class CronStatusBlock(TypedDict):
+    """`capabilities.cron` block. Both the success and failure branches in
+    `_collect_capability_metadata` populate all three keys (failure branch
+    zero-fills counts), so every field is required on the wire.
+    """
     available: bool
     jobs_total: int
     jobs_active: int
 
 
-class SurfaceSpec(TypedDict, total=False):
-    """Describes a user-facing surface (CLI, TUI, web dashboard)."""
+class SurfaceSpec(TypedDict):
+    """Describes a user-facing surface (CLI, TUI, web dashboard). `available`
+    and `command` are always present; the path/URL fields appear only for
+    surfaces that have corresponding on-disk directories.
+    """
     available: bool
     command: str
     # Present only for surfaces that have a corresponding on-disk directory:
-    path: str
-    source_path: str
-    dist_path: str
-    default_url: str
+    path: NotRequired[str]
+    source_path: NotRequired[str]
+    dist_path: NotRequired[str]
+    default_url: NotRequired[str]
 
 
-class CapabilityPayload(TypedDict, total=False):
+class CapabilityPayload(TypedDict):
     """Wire contract for `/health` → `capabilities`.
 
-    Required keys: `schema_version`, `configured_model`, `enabled_toolsets`,
-    `endpoints`, `tool_gateway`, `cron`, `surfaces`, `hermes_home`, `errors`.
-    Optional keys: `providers`, `messaging`, `gateway` (shapes derived from
-    hermes_cli.status and considered opaque to downstream consumers).
+    Every field here is populated on every invocation of
+    `_collect_capability_metadata`. Probe failures append to `errors`
+    but never drop a key, so required-by-default is the correct posture
+    and enables type-checkers to catch silent regressions.
+
+    `providers` / `messaging` / `gateway` wrap the output of
+    `hermes_cli.status._collect_status_snapshot` and are considered
+    opaque to downstream consumers — their shape is governed by
+    `hermes_cli.status`, not by this TypedDict.
     """
     schema_version: int
     configured_model: str

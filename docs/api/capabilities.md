@@ -141,6 +141,20 @@ The gateway NEVER lets a probe failure turn `/health` red:
 - Consumers that need to act on partial state should log the errors list
   and render what they can, never block on it.
 
+### Privacy posture
+
+`/health` is **not** authenticated (unlike `/v1/models`, `/v1/chat/completions`, etc.). That matters because the payload exposes:
+
+- Absolute filesystem paths: `hermes_home` (reveals username on multi-user
+  systems), `surfaces.tui.path`, `surfaces.web_dashboard.source_path` /
+  `dist_path`.
+- Runtime state: `gateway.pid`, the enabled toolset list (attack-surface
+  hint), and all configured messaging platforms.
+
+For the default single-user LAN-bound deployment this is the same information the user already has on their own machine, so it's acceptable. **If you ever bind the gateway to a public interface** (`0.0.0.0`, a reverse proxy, a tunnel), add authentication in front of `/health` or redact the path-bearing fields. The current shape is deliberately conservative for the common case, not for exposure.
+
+Treat the combination of `hermes_home` + `gateway.pid` + toolset list as enough for an attacker to build a local-file-inclusion attempt against other endpoints. Don't expose `/health` unauthenticated to untrusted networks.
+
 ---
 
 ## How to verify
