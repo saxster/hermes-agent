@@ -539,6 +539,54 @@ def _build_job_prompt(job: dict) -> str:
     return "\n".join(parts)
 
 
+def _is_upgrade_scout_job(job: dict) -> bool:
+    metadata = job.get("metadata") or {}
+    labels = job.get("labels") or []
+    return metadata.get("type") == "upgrade_scout" or "upgrade-scout" in labels
+
+
+def _run_upgrade_scout_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+    job_id = job["id"]
+    job_name = job.get("name", "Hermes Upgrade Scout")
+    try:
+        from hermes_cli.upgrade_scout import UpgradeScoutService
+
+        result = UpgradeScoutService().run_report()
+        report = result["report"]
+        brief = result["brief"]
+        output = f"""# Cron Job: {job_name}
+
+**Job ID:** {job_id}
+**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
+**Schedule:** {job.get('schedule_display', 'N/A')}
+
+{brief}
+"""
+        final_response = (
+            f"Upgrade Scout report generated: {report['id']}\n"
+            f"Risk: {report.get('risk')}\n"
+            f"{report.get('summary')}"
+        )
+        return True, output, final_response, None
+    except Exception as exc:
+        error_msg = f"{type(exc).__name__}: {exc}"
+        output = f"""# Cron Job: {job_name} (FAILED)
+
+**Job ID:** {job_id}
+**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
+**Schedule:** {job.get('schedule_display', 'N/A')}
+
+## Error
+
+```
+{error_msg}
+
+{traceback.format_exc()}
+```
+"""
+        return False, output, "", error_msg
+
+
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -546,6 +594,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
     """
+    if _is_upgrade_scout_job(job):
+        return _run_upgrade_scout_job(job)
+
     from run_agent import AIAgent
     
     # Initialize SQLite session store so cron job messages are persisted
