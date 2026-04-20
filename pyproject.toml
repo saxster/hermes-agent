@@ -119,6 +119,11 @@ hermes_cli = ["web_dist/**/*"]
 # so `pip install dist/*.whl` fails on `from hermes_cli.cmd_handlers...`
 # until both roots pick up their `.*` companion entry.
 include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*", "gateway", "gateway.*", "cron", "honcho_integration", "acp_adapter", "plugins", "plugins.*"]
+# Defense in depth against a future `agent/tests/` or `hermes_cli/fixtures/`
+# directory accidentally shipping in the wheel. Top-level `tests/` lives
+# outside these globs, so this only fires if someone introduces a
+# sub-test package under one of the included roots.
+exclude = ["*.tests", "*.tests.*", "*.fixtures", "*.fixtures.*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -12,12 +12,18 @@ on:
       - "web/**"
       - "scripts/build-web.sh"
       - ".github/workflows/build-web.yml"
+      # Packaging surface — drift here silently breaks the wheel even
+      # though the bundle itself hasn't changed.
+      - "pyproject.toml"
+      - "hermes_cli/__init__.py"
   pull_request:
     branches: [main]
     paths:
       - "web/**"
       - "scripts/build-web.sh"
       - ".github/workflows/build-web.yml"
+      - "pyproject.toml"
+      - "hermes_cli/__init__.py"
 
 concurrency:
   group: build-web-${{ github.ref }}
@@ -41,7 +47,8 @@ jobs:
       - name: Build dashboard bundle
         # scripts/build-web.sh auto-selects npm when package-lock.json
         # is present, so no explicit package-manager plumbing is needed.
-        run: scripts/build-web.sh
+        # Invoke via `bash` so we don't depend on the executable bit.
+        run: bash scripts/build-web.sh
 
       - name: Verify bundle layout
         run: |
@@ -49,8 +56,14 @@ jobs:
             || { echo "::error::web_dist/index.html missing after build"; exit 1; }
           test -d hermes_cli/web_dist/assets \
             || { echo "::error::web_dist/assets/ missing after build"; exit 1; }
+          js_count=$(find hermes_cli/web_dist/assets -maxdepth 1 -type f -name '*.js' | wc -l | tr -d ' ')
+          if [ "$js_count" -lt 1 ]; then
+            echo "::error::web_dist/assets/ contains no .js files — bundle is empty"
+            exit 1
+          fi
           echo "Bundle size: $(du -sh hermes_cli/web_dist/ | cut -f1)"
           echo "File count:  $(find hermes_cli/web_dist -type f | wc -l)"
+          echo "JS files:    $js_count"
 
       - name: Upload bundle artifact
         uses: actions/upload-artifact@v4
