@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import secrets
+import shutil
 import sys
 import threading
 import time
@@ -54,9 +55,13 @@ try:
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel
 except ImportError:
+    # fastapi + uvicorn are base dependencies of hermes-agent — this branch
+    # only fires when one of them has been manually uninstalled. Point the
+    # user at a full reinstall rather than a standalone fastapi install.
     raise SystemExit(
-        "Web UI requires fastapi and uvicorn.\n"
-        f"Install with: {sys.executable} -m pip install 'fastapi' 'uvicorn[standard]'"
+        "Web UI requires fastapi and uvicorn (normally auto-installed with "
+        "hermes-agent). Reinstall with:\n"
+        f"  {sys.executable} -m pip install -e ."
     )
 
 WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.environ else Path(__file__).parent / "web_dist"
@@ -2003,6 +2008,36 @@ async def get_usage_analytics(days: int = 30):
         db.close()
 
 
+def _build_frontend_hint() -> Dict[str, str]:
+    """Return a structured build-frontend hint for the missing-bundle 404.
+
+    Probes ``pnpm`` first (canonical for this repo — matches the lockfile),
+    falls back to ``npm``, final fallback points at pnpm's install page.
+    Recomputed per request because package-manager availability can change
+    while the server is running (user installs pnpm after boot).
+    """
+    if shutil.which("pnpm"):
+        return {
+            "error": "Frontend not built.",
+            "build_command": "cd web && pnpm install && pnpm run build",
+            "shortcut": "hermes web --build-frontend",
+            "fallback": "API-only mode: REST endpoints at /api/* work without the SPA.",
+        }
+    if shutil.which("npm"):
+        return {
+            "error": "Frontend not built.",
+            "build_command": "cd web && npm ci && npm run build",
+            "shortcut": "hermes web --build-frontend",
+            "fallback": "API-only mode: REST endpoints at /api/* work without the SPA.",
+        }
+    return {
+        "error": "Frontend not built and neither pnpm nor npm is on PATH.",
+        "install_hint": "Install pnpm (https://pnpm.io) or npm, then: cd web && pnpm install && pnpm run build",
+        "shortcut": "hermes web --build-frontend (after installing pnpm or npm)",
+        "fallback": "API-only mode: REST endpoints at /api/* work without the SPA.",
+    }
+
+
 def mount_spa(application: FastAPI):
     """Mount the built SPA. Falls back to index.html for client-side routing.
 
@@ -2013,10 +2048,7 @@ def mount_spa(application: FastAPI):
     if not WEB_DIST.exists():
         @application.get("/{full_path:path}")
         async def no_frontend(full_path: str):
-            return JSONResponse(
-                {"error": "Frontend not built. Run: cd web && npm run build"},
-                status_code=404,
-            )
+            return JSONResponse(_build_frontend_hint(), status_code=404)
         return
 
     _index_path = WEB_DIST / "index.html"
@@ -2291,6 +2323,18 @@ def start_server(
 ):
     """Start the web UI server."""
     import uvicorn
+
+    # Surface the missing-bundle situation at boot — otherwise users only
+    # see it when the first browser request lands on a 404. Uses print()
+    # to stderr rather than `_log.warning` because hermes doesn't install
+    # a root logging handler, so logger calls would be silently dropped.
+    if not WEB_DIST.exists():
+        print(
+            f"  WARNING: dashboard bundle not found at {WEB_DIST} — API-only mode.\n"
+            "           Build the SPA with `hermes web --build-frontend` "
+            "or `cd web && pnpm install && pnpm run build`.",
+            file=sys.stderr,
+        )
 
     _LOCALHOST = ("127.0.0.1", "localhost", "::1")
     if host not in _LOCALHOST and not allow_public:

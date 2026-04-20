@@ -2435,6 +2435,21 @@ def cmd_webhook(args):
 
 def cmd_dashboard(args):
     """Start the local web dashboard."""
+    if getattr(args, "build_frontend", False):
+        import subprocess
+
+        script = PROJECT_ROOT / "scripts" / "build-web.sh"
+        if not script.is_file():
+            raise SystemExit(f"build-web.sh not found at {script}")
+        print(f"  Building web dashboard frontend via {script.name} ...")
+        try:
+            subprocess.run([str(script)], check=True)
+        except subprocess.CalledProcessError as exc:
+            raise SystemExit(
+                f"Frontend build failed with exit code {exc.returncode}. "
+                "Fix the error above (usually pnpm/npm missing or lockfile drift) and retry."
+            ) from exc
+
     from hermes_cli.web_server import start_server
 
     start_server(
@@ -3877,6 +3892,11 @@ For more help on a command:
     dashboard_parser.add_argument("--port", type=int, default=9119, help="Bind port (default: 9119)")
     dashboard_parser.add_argument("--no-open", action="store_true", help="Do not open a browser window")
     dashboard_parser.add_argument("--insecure", action="store_true", help="Allow non-localhost binds")
+    dashboard_parser.add_argument(
+        "--build-frontend",
+        action="store_true",
+        help="Run scripts/build-web.sh to populate hermes_cli/web_dist/ before starting the server",
+    )
     dashboard_parser.set_defaults(func=cmd_dashboard)
     
     # =========================================================================
