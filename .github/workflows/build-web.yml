@@ -1,0 +1,73 @@
+name: Build Web Dashboard
+
+# Smoke-build the Vite/React dashboard on every push + PR that touches the
+# frontend, so TypeScript regressions surface here instead of at release time.
+# The built bundle is uploaded as an artifact for debugging but is NOT
+# committed — release.yml rebuilds it before publishing.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "scripts/build-web.sh"
+      - ".github/workflows/build-web.yml"
+      # Packaging surface — drift here silently breaks the wheel even
+      # though the bundle itself hasn't changed.
+      - "pyproject.toml"
+      - "hermes_cli/__init__.py"
+  pull_request:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "scripts/build-web.sh"
+      - ".github/workflows/build-web.yml"
+      - "pyproject.toml"
+      - "hermes_cli/__init__.py"
+
+concurrency:
+  group: build-web-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build dashboard bundle
+        # scripts/build-web.sh auto-selects npm when package-lock.json
+        # is present, so no explicit package-manager plumbing is needed.
+        # Invoke via `bash` so we don't depend on the executable bit.
+        run: bash scripts/build-web.sh
+
+      - name: Verify bundle layout
+        run: |
+          test -f hermes_cli/web_dist/index.html \
+            || { echo "::error::web_dist/index.html missing after build"; exit 1; }
+          test -d hermes_cli/web_dist/assets \
+            || { echo "::error::web_dist/assets/ missing after build"; exit 1; }
+          js_count=$(find hermes_cli/web_dist/assets -maxdepth 1 -type f -name '*.js' | wc -l | tr -d ' ')
+          if [ "$js_count" -lt 1 ]; then
+            echo "::error::web_dist/assets/ contains no .js files — bundle is empty"
+            exit 1
+          fi
+          echo "Bundle size: $(du -sh hermes_cli/web_dist/ | cut -f1)"
+          echo "File count:  $(find hermes_cli/web_dist -type f | wc -l)"
+          echo "JS files:    $js_count"
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: hermes_cli/web_dist/
+          retention-days: 7

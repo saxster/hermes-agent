@@ -1,0 +1,173 @@
+name: Release
+
+# Triggered by semver tags (v*). Builds the dashboard bundle, produces
+# sdist + wheel via `python -m build`, attaches both to the GitHub Release,
+# and — when a trusted-publisher identity is configured via the
+# `PYPI_PUBLISH` repo variable — publishes to PyPI.
+#
+# The PyPI step is gated so this workflow is safe to land without any
+# secrets provisioned: releases still get the artifacts attached, they
+# just don't auto-publish until the identity is wired up.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write  # create/update the GitHub Release + upload assets
+  # id-token write (for PyPI trusted publishing) is granted on the
+  # publish job only, so this job inherits the least-privilege default.
+
+jobs:
+  # Auth gate. Every downstream job requires the tag to point at a
+  # commit reachable from `main`. Without this check, anyone with push
+  # access could push `v0.0.1-evil` pointing at an arbitrary SHA and the
+  # Release-asset + PyPI-publish steps would execute against that code.
+  # The gate runs first, fails fast, and blocks the rest of the pipeline.
+  authorize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify tag is reachable from main
+        run: |
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "::error::Tag ${GITHUB_REF} points at $GITHUB_SHA, which is not reachable from main."
+            echo "Only tags on the main branch may trigger a release."
+            exit 1
+          fi
+          echo "Tag verified: $GITHUB_SHA is reachable from main."
+
+  build:
+    needs: authorize
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      wheel: ${{ steps.artifacts.outputs.wheel }}
+      sdist: ${{ steps.artifacts.outputs.sdist }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Build dashboard bundle
+        # Start from a clean dist/ so the verify-wheel step sees exactly
+        # one artifact pair and downstream globbing is deterministic.
+        run: |
+          rm -rf dist/ build/
+          bash scripts/build-web.sh
+
+      - name: Build sdist + wheel
+        run: |
+          uv venv .venv --python 3.11
+          source .venv/bin/activate
+          uv pip install build
+          python -m build
+
+      - name: Verify wheel ships web_dist/ and subpackages
+        # Guard against silent packaging regressions that either drop
+        # the dashboard bundle (empty assets/) or drop a subpackage.
+        run: |
+          source .venv/bin/activate
+          wheels=(dist/hermes_agent-*.whl)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one wheel, got ${#wheels[@]}"
+            ls -la dist/
+            exit 1
+          fi
+          wheel_path="${wheels[0]}"
+          echo "Inspecting $wheel_path"
+
+          # zipfile -l lines are "<name><spaces><date><spaces><size>",
+          # so anchor the .js extension to a trailing whitespace rather
+          # than end-of-line.
+          js_entries=$(python -m zipfile -l "$wheel_path" | grep -cE "^hermes_cli/web_dist/assets/[^[:space:]]+\.js[[:space:]]" || true)
+          if [ "$js_entries" -lt 1 ]; then
+            echo "::error::wheel has no hermes_cli/web_dist/assets/*.js — bundle likely empty"
+            python -m zipfile -l "$wheel_path" | head -60
+            exit 1
+          fi
+          echo "web_dist assets: $js_entries JS file(s) — OK"
+
+          for pkg in \
+              "hermes_cli/cmd_handlers" \
+              "hermes_cli/auth" \
+              "agent/auxiliary"; do
+            if ! python -m zipfile -l "$wheel_path" | grep -q "^${pkg}/__init__.py"; then
+              echo "::error::wheel missing ${pkg}/__init__.py — packages.find regression"
+              exit 1
+            fi
+          done
+          echo "Subpackages verified — OK"
+
+      - name: Record artifact paths
+        id: artifacts
+        run: |
+          wheels=(dist/hermes_agent-*.whl)
+          sdists=(dist/hermes_agent-*.tar.gz)
+          echo "wheel=${wheels[0]}" >> "$GITHUB_OUTPUT"
+          echo "sdist=${sdists[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload dist/ as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: dist/
+          retention-days: 30
+
+      - name: Attach dist to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+          # The Release is auto-created by the tag if it doesn't exist.
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+  publish-pypi:
+    # Gated: only runs when repo variable PYPI_PUBLISH == "true".
+    # Set it to "true" after configuring PyPI trusted publishing for this
+    # repo (https://docs.pypi.org/trusted-publishers/).
+    needs: build
+    if: vars.PYPI_PUBLISH == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/hermes-agent/
+    permissions:
+      id-token: write  # required for trusted publishing
+    steps:
+      - name: Download dist/ artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist/
+
+      - name: Publish to PyPI
+        # Pinned to v1.14.0 commit SHA rather than the `release/v1`
+        # branch ref — branch refs are mutable and a compromised
+        # publisher action would run with id-token: write.
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b  # v1.14.0
+        with:
+          packages-dir: dist/

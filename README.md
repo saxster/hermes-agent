@@ -44,6 +44,18 @@ source ~/.bashrc    # reload shell (or: source ~/.zshrc)
 hermes              # start chatting!
 ```
 
+### pip install (alternative)
+
+If you already have Python 3.11+ and want to skip the bootstrap script:
+
+| Source                      | Command                                     | Dashboard bundle  |
+|-----------------------------|---------------------------------------------|-------------------|
+| PyPI wheel                  | `pip install hermes-agent`                  | Pre-built in the wheel. `hermes web` works out of the box. |
+| Built wheel (git clone)     | `scripts/build-web.sh && python -m build && pip install dist/hermes_agent-*.whl` | Pre-built. |
+| Editable dev install        | `pip install -e .`                          | Not built. Run `hermes web --build-frontend` once (requires Node 20 + npm or pnpm) or `cd web && npm ci && npm run build`. |
+
+The `hermes web --build-frontend` convenience flag (PR #5) builds the bundle in place, so editable installs can serve the dashboard after a one-time build.
+
 ---
 
 ## Getting Started
