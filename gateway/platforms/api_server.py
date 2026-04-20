@@ -28,7 +28,7 @@ import os
 import sqlite3
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Final, List, NotRequired, Optional, Required, TypedDict
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -68,6 +68,114 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
+
+
+# ---------------------------------------------------------------------------
+# Capability metadata contract
+# ---------------------------------------------------------------------------
+# The /health endpoint returns `capabilities: <CapabilityPayload>` — a
+# machine-readable snapshot of what this hermes-agent instance can do.
+# Three downstream consumers bind against this shape today:
+#   * hermes-companion (Swift Codable)
+#   * mission-control (TypeScript types)
+#   * hermes-webui (Python, in-process)
+#
+# Rules for evolving the shape:
+#   1. ADDITIVE changes (new keys, new nested keys) → NO schema bump.
+#      Consumers tolerate unknown keys.
+#   2. BREAKING changes (rename, remove, type change) → bump
+#      CAPABILITIES_SCHEMA_VERSION and document the diff in
+#      docs/api/capabilities.md. Clients compare the version they expect
+#      against the one on the wire and fall back / warn / refuse as
+#      appropriate.
+#   3. Errors discovered while collecting a section MUST append a human
+#      string to `errors`, never raise; /health stays cheap and never
+#      fails just because one probe is unhappy.
+#
+# History:
+#   v1 — initial shape shipped with the companion capability integration.
+#   v2 — added `tool_gateway`, `surfaces`, `cron.available`, reorganised
+#        `providers` / `messaging` / `gateway` to wrap the status snapshot.
+CAPABILITIES_SCHEMA_VERSION: Final[int] = 2
+
+
+class ToolGatewayFeature(TypedDict):
+    """One row of `capabilities.tool_gateway.features`.
+
+    All keys are populated by `hermes_cli.nous_subscription.get_nous_subscription_features`
+    for every feature row. `current_provider` is the only field that can be
+    None (when no provider has been configured yet).
+    """
+    key: str
+    label: str
+    available: bool
+    active: bool
+    managed_by_nous: bool
+    direct_override: bool
+    toolset_enabled: bool
+    current_provider: Optional[str]
+
+
+class ToolGatewayBlock(TypedDict):
+    """`capabilities.tool_gateway` block. On probe failure the collector
+    falls back to `{"available": False, "features": []}` — both keys are
+    always present. `provider_is_nous` is only populated on the success
+    path, so it's NotRequired.
+    """
+    available: bool
+    features: List[ToolGatewayFeature]
+    provider_is_nous: NotRequired[bool]
+
+
+class CronStatusBlock(TypedDict):
+    """`capabilities.cron` block. Both the success and failure branches in
+    `_collect_capability_metadata` populate all three keys (failure branch
+    zero-fills counts), so every field is required on the wire.
+    """
+    available: bool
+    jobs_total: int
+    jobs_active: int
+
+
+class SurfaceSpec(TypedDict):
+    """Describes a user-facing surface (CLI, TUI, web dashboard). `available`
+    and `command` are always present; the path/URL fields appear only for
+    surfaces that have corresponding on-disk directories.
+    """
+    available: bool
+    command: str
+    # Present only for surfaces that have a corresponding on-disk directory:
+    path: NotRequired[str]
+    source_path: NotRequired[str]
+    dist_path: NotRequired[str]
+    default_url: NotRequired[str]
+
+
+class CapabilityPayload(TypedDict):
+    """Wire contract for `/health` → `capabilities`.
+
+    Every field here is populated on every invocation of
+    `_collect_capability_metadata`. Probe failures append to `errors`
+    but never drop a key, so required-by-default is the correct posture
+    and enables type-checkers to catch silent regressions.
+
+    `providers` / `messaging` / `gateway` wrap the output of
+    `hermes_cli.status._collect_status_snapshot` and are considered
+    opaque to downstream consumers — their shape is governed by
+    `hermes_cli.status`, not by this TypedDict.
+    """
+    schema_version: int
+    configured_model: str
+    enabled_toolsets: List[str]
+    endpoints: List[str]
+    providers: Dict[str, Any]
+    messaging: Dict[str, Any]
+    gateway: Dict[str, Any]
+    cron: CronStatusBlock
+    tool_gateway: ToolGatewayBlock
+    surfaces: Dict[str, SurfaceSpec]
+    hermes_home: str
+    errors: List[str]
 
 
 # The gateway now uses FastAPI + uvicorn (aiohttp is no longer required),
@@ -605,12 +713,18 @@ class APIServerAdapter(BasePlatformAdapter):
     # HTTP Handlers
     # ------------------------------------------------------------------
 
-    def _collect_capability_metadata(self) -> Dict[str, Any]:
+    def _collect_capability_metadata(self) -> CapabilityPayload:
         """Return machine-readable local capabilities for desktop clients.
 
         Keep this conservative and best-effort: `/health` must stay cheap and
         should never fail just because an optional provider, dashboard, or
-        status probe is unavailable.
+        status probe is unavailable. Errors encountered while gathering a
+        section are appended to the `errors` list; downstream consumers
+        treat `errors` as advisory, not fatal.
+
+        Shape is governed by `CapabilityPayload` / `CAPABILITIES_SCHEMA_VERSION`
+        at the top of this module. See docs/api/capabilities.md for the
+        consumer-facing contract.
         """
         errors: List[str] = []
         try:
@@ -692,7 +806,7 @@ class APIServerAdapter(BasePlatformAdapter):
         web_dist = os.path.join(project_root, "hermes_cli", "web_dist")
 
         return {
-            "schema_version": 2,
+            "schema_version": CAPABILITIES_SCHEMA_VERSION,
             "configured_model": configured_model,
             "enabled_toolsets": enabled_toolsets,
             "endpoints": [

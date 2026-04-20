@@ -3,7 +3,11 @@ from httpx import ASGITransport, AsyncClient
 import pytest
 
 from gateway.config import PlatformConfig
-from gateway.platforms.api_server import APIServerAdapter
+from gateway.platforms.api_server import (
+    APIServerAdapter,
+    CAPABILITIES_SCHEMA_VERSION,
+    CapabilityPayload,
+)
 
 
 class FakeUpgradeScout:
@@ -101,10 +105,77 @@ async def test_health_includes_companion_capability_contract(monkeypatch):
     body = response.json()
     capabilities = body["capabilities"]
     assert body["version"] == "0.10.0+hermes.local"
-    assert capabilities["schema_version"] == 2
+    assert capabilities["schema_version"] == CAPABILITIES_SCHEMA_VERSION
     assert capabilities["tool_gateway"]["available"] is True
     assert capabilities["cron"]["jobs_active"] == 1
     assert capabilities["surfaces"]["web_dashboard"]["command"] == "hermes dashboard"
+
+
+def test_capability_schema_version_matches_wire_constant():
+    """Pinned-literal guard against accidental version bumps.
+
+    The assertion `payload["schema_version"] == 2` is a DELIBERATE LITERAL.
+    It's NOT the same thing as asserting against the constant — the
+    constant drives the value on the wire, so `payload["schema_version"]
+    == CAPABILITIES_SCHEMA_VERSION` is tautological and would silently
+    accept an undeclared bump.
+
+    Policy: bumping CAPABILITIES_SCHEMA_VERSION requires BOTH a change
+    to this literal AND an update to docs/api/capabilities.md's History
+    table. The two-file edit is the intentional friction.
+    """
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    payload = adapter._collect_capability_metadata()
+
+    assert isinstance(CAPABILITIES_SCHEMA_VERSION, int), \
+        "CAPABILITIES_SCHEMA_VERSION must be a plain int for wire encoding"
+    # Pinned literal — see docstring above. DO NOT change this to
+    # CAPABILITIES_SCHEMA_VERSION without also updating the history
+    # table in docs/api/capabilities.md.
+    assert payload["schema_version"] == 2
+    # Also assert the constant stays in sync so renaming one without
+    # the other fails loudly.
+    assert payload["schema_version"] == CAPABILITIES_SCHEMA_VERSION
+
+    # Structural sanity — every required top-level key is present even on
+    # an unconfigured instance (collector catches probe errors and still
+    # returns the scaffold).
+    for key in (
+        "schema_version",
+        "configured_model",
+        "enabled_toolsets",
+        "endpoints",
+        "cron",
+        "tool_gateway",
+        "surfaces",
+        "hermes_home",
+        "errors",
+    ):
+        assert key in payload, f"capabilities payload missing required key: {key}"
+
+    # Nested required-key structure: cron + tool_gateway + at least one
+    # surface row. This catches the exact regression we shipped this PR
+    # to prevent — a future refactor dropping `tool_gateway.features`
+    # would fail type-checking locally but also fail this test in CI.
+    for key in ("available", "jobs_total", "jobs_active"):
+        assert key in payload["cron"], f"cron block missing {key}"
+    for key in ("available", "features"):
+        assert key in payload["tool_gateway"], f"tool_gateway block missing {key}"
+    assert "classic_cli" in payload["surfaces"], "surfaces should include classic_cli"
+
+
+def test_capability_payload_typeddict_importable():
+    """CapabilityPayload is a re-exportable symbol, not a private helper.
+
+    Downstream Python consumers (hermes-webui) import this TypedDict by
+    name to annotate their own code. If a refactor moves or renames it,
+    this test fails loudly instead of silently breaking wheel users.
+    """
+    from gateway.platforms import api_server
+
+    assert hasattr(api_server, "CapabilityPayload")
+    assert hasattr(api_server, "CAPABILITIES_SCHEMA_VERSION")
+    assert api_server.CapabilityPayload is CapabilityPayload
 
 
 @pytest.mark.asyncio
