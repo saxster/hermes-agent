@@ -76,6 +76,27 @@ jobs:
           rm -rf dist/ build/
           bash scripts/build-web.sh
 
+      - name: Derive version from tag
+        # Normalize the git tag into a PEP 440 version and inject it
+        # into pyproject.toml + hermes_cli/__init__.py. Rationale:
+        # the repo's hardcoded dev version is `0.10.0+hermes.local`,
+        # which has a local-version segment PyPI rejects on upload.
+        # The tag is the single source of truth at release time.
+        #
+        # Accepted tag shapes:
+        #   v0.10.0            → 0.10.0
+        #   v0.10.0.dev1       → 0.10.0.dev1
+        #   v0.10.0.rc1        → 0.10.0rc1
+        #   v0.10.0-dev.1      → 0.10.0.dev1   (normalized)
+        # Anything else fails the step loudly so a malformed tag never
+        # becomes a malformed release.
+        run: |
+          python scripts/release-stamp-version.py "${GITHUB_REF_NAME}"
+          echo "=== pyproject.toml ==="
+          grep '^version = ' pyproject.toml
+          echo "=== hermes_cli/__init__.py ==="
+          grep '^__version__' hermes_cli/__init__.py
+
       - name: Build sdist + wheel
         run: |
           uv venv .venv --python 3.11
