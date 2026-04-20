@@ -106,6 +106,12 @@ hermes-acp = "acp_adapter.entry:main"
 [tool.setuptools]
 py-modules = ["run_agent", "model_tools", "toolsets", "batch_runner", "trajectory_compressor", "toolset_distributions", "cli", "hermes_constants", "hermes_state", "hermes_time", "hermes_logging", "rl_cli", "utils"]
 
+[tool.setuptools.package-data]
+# Ship the Vite-built dashboard inside the wheel so `pip install hermes-agent`
+# + `hermes web` serves the SPA without a separate Node toolchain. The bundle
+# is produced by scripts/build-web.sh (invoked by CI + the release workflow).
+hermes_cli = ["web_dist/**/*"]
+
 [tool.setuptools.packages.find]
 include = ["agent", "tools", "tools.*", "hermes_cli", "gateway", "gateway.*", "cron", "honcho_integration", "acp_adapter", "plugins", "plugins.*"]
 
