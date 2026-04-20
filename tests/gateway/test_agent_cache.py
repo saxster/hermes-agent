@@ -258,3 +258,64 @@ class TestAgentCacheLifecycle:
         cb3 = lambda *a: None
         agent.tool_progress_callback = cb3
         assert agent.tool_progress_callback is cb3
+
+
+class TestEvictFiresMemoryTeardown:
+    """F-M6 regression: _evict_cached_agent must run shutdown_memory_provider
+    on the cached agent before removing it from cache. Previously the cache
+    dropped the agent first and the hook never fired for long-lived gateway
+    sessions."""
+
+    def test_evict_calls_shutdown_memory_provider(self):
+        runner = _make_runner()
+        agent = MagicMock()
+        agent.shutdown_memory_provider = MagicMock()
+        runner._agent_cache["sess-abc"] = agent
+
+        runner._evict_cached_agent("sess-abc")
+
+        agent.shutdown_memory_provider.assert_called_once_with(messages=None)
+        assert "sess-abc" not in runner._agent_cache
+
+    def test_evict_passes_messages_when_provided(self):
+        runner = _make_runner()
+        agent = MagicMock()
+        agent.shutdown_memory_provider = MagicMock()
+        runner._agent_cache["sess-xyz"] = agent
+
+        msgs = [{"role": "user", "content": "hi"}]
+        runner._evict_cached_agent("sess-xyz", messages=msgs)
+
+        agent.shutdown_memory_provider.assert_called_once_with(messages=msgs)
+
+    def test_evict_tolerates_missing_attribute(self):
+        """Old agents without shutdown_memory_provider must not crash eviction."""
+        runner = _make_runner()
+        agent = MagicMock(spec=[])  # no attributes
+        runner._agent_cache["sess-old"] = agent
+
+        # Should not raise
+        runner._evict_cached_agent("sess-old")
+        assert "sess-old" not in runner._agent_cache
+
+    def test_evict_tolerates_teardown_exception(self):
+        """A crashing shutdown hook must not leak the agent in the cache."""
+        runner = _make_runner()
+        agent = MagicMock()
+        agent.shutdown_memory_provider = MagicMock(side_effect=RuntimeError("boom"))
+        runner._agent_cache["sess-bad"] = agent
+
+        runner._evict_cached_agent("sess-bad")
+
+        assert "sess-bad" not in runner._agent_cache
+        agent.shutdown_memory_provider.assert_called_once()
+
+    def test_evict_on_missing_cache_is_noop(self):
+        """Bare runner without _agent_cache must not crash."""
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        # Deliberately do not set _agent_cache
+        runner._agent_cache_lock = None
+        # Should not raise
+        runner._evict_cached_agent("anything")

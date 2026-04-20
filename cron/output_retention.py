@@ -16,11 +16,13 @@ on a cadence from the scheduler, or via `hermes cron gc`.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+import tempfile
 import time
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +42,70 @@ def _job_dir(job_id: str) -> Path:
     return _output_root() / job_id
 
 
-# Per-job last-rotation timestamps, in memory. Not persisted — on process
-# restart we re-rotate, which is safe (rotation is idempotent).
+def _state_path() -> Path:
+    return _output_root() / ".rotation_state.json"
+
+
+# Per-job last-rotation timestamps. Persisted across process restarts so
+# gateway restarts no longer reset every job's damper — a previous in-memory
+# dict caused hot-rotating flaps for jobs whose gateway was restarted multiple
+# times per hour (F-M1 in the audit).
 _last_rotation: dict[str, float] = {}
+_state_loaded = False
+
+
+def _load_state() -> None:
+    """Populate `_last_rotation` from disk. Idempotent, tolerant of missing/bad files."""
+    global _state_loaded
+    if _state_loaded:
+        return
+    _state_loaded = True
+    path = _state_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        logger.warning("rotation state load failed: %s", exc)
+        return
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.warning("rotation state parse failed: %s", exc)
+        return
+    if not isinstance(data, dict):
+        return
+    for k, v in data.items():
+        try:
+            _last_rotation[str(k)] = float(v)
+        except (TypeError, ValueError):
+            continue
+
+
+def _save_state() -> None:
+    """Atomically persist `_last_rotation` to disk. Best-effort; logs on failure."""
+    path = _state_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("rotation state mkdir failed: %s", exc)
+        return
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=".rotation_", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(_last_rotation, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except OSError as exc:
+        logger.warning("rotation state save failed: %s", exc)
 
 
 def _list_files_oldest_first(dir_: Path) -> List[Tuple[Path, float, int]]:
@@ -139,17 +202,56 @@ def rotate_all(*, dry_run: bool = False) -> Tuple[int, int]:
     return (total_deleted, total_reclaimed)
 
 
+def nightly_cleanup(*, prune_older_than_days: int = 90, dry_run: bool = False) -> Dict[str, int]:
+    """F-M1: built-in nightly maintenance pass.
+
+    Intended to be invoked from a shipped cron job (e.g. ``0 3 * * *``) so
+    operators don't have to remember to run cleanup themselves. Rotates
+    every job's output dir (honoring MAX_AGE_DAYS + MAX_SIZE_BYTES_PER_JOB)
+    and prunes ended sessions older than ``prune_older_than_days`` from the
+    SessionDB.
+
+    Returns a summary dict ``{files_deleted, bytes_reclaimed, sessions_pruned}``
+    that the caller can surface in the cron job's output.
+    """
+    files_deleted, bytes_reclaimed = rotate_all(dry_run=dry_run)
+    sessions_pruned = 0
+    if not dry_run:
+        try:
+            # Lazy import to keep this module dependency-light when only
+            # rotate_job is used.
+            from hermes_state import SessionDB
+            db = SessionDB()
+            sessions_pruned = db.prune_sessions(older_than_days=prune_older_than_days)
+        except Exception as exc:  # pragma: no cover — best-effort
+            logger.warning("nightly_cleanup: prune_sessions failed: %s", exc)
+    logger.info(
+        "nightly_cleanup: files_deleted=%d bytes_reclaimed=%d sessions_pruned=%d dry_run=%s",
+        files_deleted, bytes_reclaimed, sessions_pruned, dry_run,
+    )
+    return {
+        "files_deleted": files_deleted,
+        "bytes_reclaimed": bytes_reclaimed,
+        "sessions_pruned": sessions_pruned,
+    }
+
+
 def maybe_rotate_after_run(job_id: str) -> None:
     """Opportunistic rotation called after a successful job run.
 
-    Damped so we rotate at most once per MIN_INTERVAL_SECONDS per job.
+    Damped so we rotate at most once per MIN_INTERVAL_SECONDS per job. The
+    damper state is persisted to ~/.hermes/cron/output/.rotation_state.json
+    so gateway restarts do not reset cooldowns (F-M1).
+
     Swallows all errors — retention must never affect job execution.
     """
+    _load_state()
     now = time.time()
     last = _last_rotation.get(job_id, 0.0)
     if now - last < MIN_INTERVAL_SECONDS:
         return
     _last_rotation[job_id] = now
+    _save_state()
     try:
         rotate_job(job_id)
     except Exception as exc:  # pragma: no cover — best-effort

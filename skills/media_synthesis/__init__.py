@@ -1,0 +1,1 @@
+# Media Synthesis skill package

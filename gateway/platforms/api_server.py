@@ -650,11 +650,26 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        # F-M4: bind a request id for the whole handler so every log line
+        # and every downstream module has a correlation token. Echoes back
+        # to the caller via X-Hermes-Request-Id header.
+        from hermes_logging import bind_request_id
+        client_request_id = request.headers.get("X-Hermes-Request-Id", "").strip()
+        with bind_request_id(client_request_id or None) as request_id:
+            return await self._handle_chat_completions_inner(request, request_id)
+
+    async def _handle_chat_completions_inner(
+        self, request: Request, request_id: str,
+    ) -> Response:
+        """Inner handler — runs with request_id already bound in context."""
         # Parse request body
         try:
             body = await request.json()
         except (json.JSONDecodeError, Exception):
-            return json_response(_openai_error("Invalid JSON in request body"), status=400)
+            return json_response(
+                _openai_error("Invalid JSON in request body"), status=400,
+                headers={"X-Hermes-Request-Id": request_id},
+            )
 
         messages = body.get("messages")
         if not messages or not isinstance(messages, list):
@@ -861,7 +876,10 @@ class APIServerAdapter(BasePlatformAdapter):
             },
         }
 
-        return json_response(response_data, headers={"X-Hermes-Session-Id": session_id})
+        return json_response(response_data, headers={
+            "X-Hermes-Session-Id": session_id,
+            "X-Hermes-Request-Id": request_id,
+        })
 
     async def _write_sse_chat_completion(
         self, request: Request, completion_id: str, model: str,
@@ -877,6 +895,15 @@ class APIServerAdapter(BasePlatformAdapter):
             sse_headers.update(cors)
         if session_id:
             sse_headers["X-Hermes-Session-Id"] = session_id
+        # F-M4: echo request id on SSE responses so companion/webui can log
+        # the correlation token alongside any errors the user reports.
+        try:
+            from hermes_logging import get_request_id as _get_rid
+            _rid = _get_rid()
+            if _rid:
+                sse_headers["X-Hermes-Request-Id"] = _rid
+        except ImportError:  # pragma: no cover — logging module always present
+            pass
 
         async def event_generator():
             try:
@@ -1392,6 +1419,123 @@ class APIServerAdapter(BasePlatformAdapter):
             return json_response({"job": job})
         except Exception as e:
             return json_response({"error": str(e)}, status=500)
+
+    _MEDIA_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "../../../mission-control/public/media_output")
+
+    async def _handle_media_synthesize(self, request: Request) -> Response:
+        """POST /v1/media/synthesize — start a media synthesis background task."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+            topic = body.get("topic")
+            source_refs = body.get("source_refs", [])
+
+            from skills.media_synthesis.orchestrator import MediaSynthesisOrchestrator
+
+            async def run_agent_coro(sys_prompt, user_prompt):
+                result, _ = await self._run_agent(
+                    user_message=user_prompt,
+                    conversation_history=[],
+                    ephemeral_system_prompt=sys_prompt,
+                    session_id=str(uuid.uuid4())
+                )
+                return result.get("final_response", "{}")
+
+            # Generate a stable bundle ID for retrieval
+            bundle_id = uuid.uuid4().hex[:12]
+            output_dir = os.path.join(self._MEDIA_OUTPUT_DIR, bundle_id)
+
+            orchestrator = MediaSynthesisOrchestrator(run_agent_coro)
+            result = await orchestrator.execute_pipeline(topic, source_refs, output_dir)
+            result["bundle_id"] = bundle_id
+
+            return json_response(result)
+        except Exception as e:
+            logger.error(f"Media synthesize error: {e}", exc_info=True)
+            return json_response({"error": str(e)}, status=500)
+
+    async def _handle_get_bundle(self, request: Request) -> Response:
+        """GET /v1/media/bundle/{bundle_id} — retrieve a completed media bundle."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        bundle_id = request.path_params.get("bundle_id", "")
+        if not bundle_id or not __import__("re").fullmatch(r"[a-f0-9]{12}", bundle_id):
+            return json_response({"error": "Invalid bundle ID"}, status=400)
+
+        bundle_dir = os.path.join(self._MEDIA_OUTPUT_DIR, bundle_id)
+        article_path = os.path.join(bundle_dir, "article.md")
+
+        if not os.path.isdir(bundle_dir) or not os.path.isfile(article_path):
+            return json_response({"error": "Bundle not found"}, status=404)
+
+        try:
+            with open(article_path, "r") as f:
+                markdown_content = f.read()
+
+            # Find the audio file (first .mp3 in the directory)
+            audio_file = next(
+                (fn for fn in os.listdir(bundle_dir) if fn.endswith(".mp3")),
+                None,
+            )
+
+            # Extract title from first markdown heading
+            title = "Untitled Bundle"
+            for line in markdown_content.splitlines():
+                if line.startswith("# "):
+                    title = line[2:].strip()
+                    break
+
+            return json_response({
+                "bundle_id": bundle_id,
+                "title": title,
+                "audio_url": f"/media_output/{bundle_id}/{audio_file}" if audio_file else None,
+                "markdown_content": markdown_content,
+            })
+        except Exception as e:
+            logger.error(f"Error reading bundle {bundle_id}: {e}", exc_info=True)
+            return json_response({"error": str(e)}, status=500)
+
+    async def _handle_list_bundles(self, request: Request) -> Response:
+        """GET /v1/media/bundles — list all completed media bundles."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        bundles = []
+        output_dir = self._MEDIA_OUTPUT_DIR
+        if os.path.isdir(output_dir):
+            for entry in sorted(os.listdir(output_dir), reverse=True):
+                bundle_dir = os.path.join(output_dir, entry)
+                article_path = os.path.join(bundle_dir, "article.md")
+                if not os.path.isdir(bundle_dir) or not os.path.isfile(article_path):
+                    continue
+                try:
+                    with open(article_path, "r") as f:
+                        first_lines = f.read(500)
+                    title = "Untitled Bundle"
+                    for line in first_lines.splitlines():
+                        if line.startswith("# "):
+                            title = line[2:].strip()
+                            break
+                    audio_file = next(
+                        (fn for fn in os.listdir(bundle_dir) if fn.endswith(".mp3")),
+                        None,
+                    )
+                    bundles.append({
+                        "bundle_id": entry,
+                        "title": title,
+                        "has_audio": audio_file is not None,
+                        "created_at": int(os.path.getmtime(article_path)),
+                    })
+                except Exception:
+                    continue
+
+        return json_response({"bundles": bundles})
 
     async def _handle_delete_job(self, request: Request) -> Response:
         """DELETE /api/jobs/{job_id} — delete a cron job."""
@@ -2129,6 +2273,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.add_api_route("/v1/runs", self._handle_runs, methods=["POST"])
             self._app.add_api_route("/v1/runs/{run_id}/events", self._handle_run_events, methods=["GET"])
             self._app.add_api_route("/api/memory/search", self._handle_memory_search, methods=["GET"])
+            self._app.add_api_route("/v1/media/synthesize", self._handle_media_synthesize, methods=["POST"])
+            self._app.add_api_route("/v1/media/bundles", self._handle_list_bundles, methods=["GET"])
+            self._app.add_api_route("/v1/media/bundle/{bundle_id}", self._handle_get_bundle, methods=["GET"])
 
             # Start background sweep to clean up orphaned runs
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())

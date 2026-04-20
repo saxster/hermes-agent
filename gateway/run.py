@@ -5587,12 +5587,46 @@ class GatewayRunner:
         )
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
-    def _evict_cached_agent(self, session_key: str) -> None:
-        """Remove a cached agent for a session (called on /new, /model, etc)."""
+    def _evict_cached_agent(
+        self,
+        session_key: str,
+        *,
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """Remove a cached agent for a session (called on /new, /model, etc).
+
+        F-M6: Before dropping the agent, fire its `shutdown_memory_provider`
+        hook so memory providers see the session-end boundary. Previously the
+        cached agent was destroyed first and hooks never ran — a long-running
+        multi-turn gateway session would evict without ever flushing memory
+        observations. If messages is None the memory manager still gets a
+        chance to `shutdown_all()` (release resources), but per-session fact
+        extraction runs on an empty list — passing real messages requires a
+        SessionDB read at the call site.
+        """
         _lock = getattr(self, "_agent_cache_lock", None)
+
+        def _teardown(agent) -> None:
+            if agent is None:
+                return
+            try:
+                if hasattr(agent, "shutdown_memory_provider"):
+                    agent.shutdown_memory_provider(messages=messages)
+            except Exception as exc:
+                logger.debug("shutdown_memory_provider raised on evict: %s", exc)
+
+        cache = getattr(self, "_agent_cache", None)
+        if cache is None:
+            # Legacy/bare GatewayRunner without a per-session agent cache.
+            return
         if _lock:
             with _lock:
-                self._agent_cache.pop(session_key, None)
+                agent = cache.pop(session_key, None)
+        else:
+            agent = cache.pop(session_key, None)
+        # Run teardown outside the cache lock — providers may do I/O and we
+        # don't want to block other callers on the cache mutex.
+        _teardown(agent)
 
     async def _run_agent(
         self,

@@ -191,6 +191,25 @@ def _install_safe_stdio() -> None:
 
 
 
+class SessionCostCapExceeded(RuntimeError):
+    """Raised when the per-session estimated LLM cost has reached its cap.
+
+    F-H1: ``HERMES_SESSION_COST_CAP_USD`` (or the ``session_cost_cap_usd``
+    kwarg on :class:`AIAgent`) sets a ceiling. Before each LLM call, the
+    accumulated ``session_estimated_cost_usd`` is checked; if it has reached
+    the cap, this exception is raised instead of making another call. The
+    main loop catches it, breaks, and returns the partial result with a
+    clear final message.
+    """
+
+    def __init__(self, spent_usd: float, cap_usd: float):
+        self.spent_usd = spent_usd
+        self.cap_usd = cap_usd
+        super().__init__(
+            f"session cost cap reached: ${spent_usd:.4f} spent of ${cap_usd:.2f} cap"
+        )
+
+
 class AIAgent:
     """
     AI Agent with tool calling capabilities.
@@ -271,6 +290,7 @@ class AIAgent:
         pass_session_id: bool = False,
         persist_session: bool = True,
         council_enabled: Optional[bool] = None,
+        session_cost_cap_usd: Optional[float] = None,
     ):
         """
         Initialize the AI Agent.
@@ -1062,7 +1082,27 @@ class AIAgent:
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
-        
+
+        # F-H1 session cost ceiling. Precedence: explicit kwarg > env var > None.
+        # A cap of None or <=0 means unlimited (preserves current behavior).
+        # When set, the loop raises SessionCostCapExceeded before the next LLM
+        # call if the accumulated estimated cost has reached the cap.
+        _env_cap_raw = os.environ.get("HERMES_SESSION_COST_CAP_USD", "").strip()
+        _env_cap_val: Optional[float] = None
+        if _env_cap_raw:
+            try:
+                _parsed = float(_env_cap_raw)
+                if _parsed > 0:
+                    _env_cap_val = _parsed
+            except ValueError:
+                logger.warning(
+                    "HERMES_SESSION_COST_CAP_USD=%r is not a number; ignoring", _env_cap_raw,
+                )
+        self.session_cost_cap_usd: Optional[float] = (
+            session_cost_cap_usd if session_cost_cap_usd and session_cost_cap_usd > 0
+            else _env_cap_val
+        )
+
         if not self.quiet_mode:
             if compression_enabled:
                 print(f"📊 Context limit: {self.context_compressor.context_length:,} tokens (compress at {int(compression_threshold*100)}% = {self.context_compressor.threshold_tokens:,})")
@@ -1114,7 +1154,41 @@ class AIAgent:
             self.context_compressor._context_probe_persistable = False
             # Iterative summary from previous session must not bleed into new one (#2635)
             self.context_compressor._previous_summary = None
-    
+
+        # Todo list: in-memory planning state is per-session; drop the previous
+        # session's items so a fresh session starts with an empty planner.
+        # Keeps the old layering violation from the CLI (which used to poke
+        # self.agent._todo_store directly) confined to the agent itself.
+        from tools.todo_tool import TodoStore
+        self._todo_store = TodoStore()
+
+    def prepare_for_session_switch(
+        self,
+        session_id: str,
+        *,
+        flushed_db_idx: int = 0,
+        session_start: Optional[datetime] = None,
+    ) -> None:
+        """Atomically re-point the agent at a different session.
+
+        Called by the CLI (on /new, /reset, /resume, etc.) to switch the
+        agent to another session without destroying the instance. Handles
+        session_id assignment, per-session state reset (token counters,
+        compressor, todo store), DB-flush-cursor alignment, and system-
+        prompt-cache invalidation so the next turn rebuilds with the new
+        session's context.
+
+        This is the public replacement for the CLI pattern that used to
+        reach into private attributes (``self.agent._todo_store``,
+        ``self.agent._last_flushed_db_idx``, ``self.agent._invalidate_system_prompt``).
+        """
+        self.session_id = session_id
+        if session_start is not None:
+            self.session_start = session_start
+        self.reset_session_state()
+        self._last_flushed_db_idx = flushed_db_idx
+        self._invalidate_system_prompt()
+
     def _safe_print(self, *args, **kwargs):
         """Print that silently handles broken pipes / closed stdout.
 
@@ -2682,108 +2756,21 @@ class AIAgent:
 
     @staticmethod
     def _sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Fix orphaned tool_call / tool_result pairs before every LLM call.
-
-        Runs unconditionally — not gated on whether the context compressor
-        is present — so orphans from session loading or manual message
-        manipulation are always caught.
-        """
-        surviving_call_ids: set = set()
-        for msg in messages:
-            if msg.get("role") == "assistant":
-                for tc in msg.get("tool_calls") or []:
-                    cid = AIAgent._get_tool_call_id_static(tc)
-                    if cid:
-                        surviving_call_ids.add(cid)
-
-        result_call_ids: set = set()
-        for msg in messages:
-            if msg.get("role") == "tool":
-                cid = msg.get("tool_call_id")
-                if cid:
-                    result_call_ids.add(cid)
-
-        # 1. Drop tool results with no matching assistant call
-        orphaned_results = result_call_ids - surviving_call_ids
-        if orphaned_results:
-            messages = [
-                m for m in messages
-                if not (m.get("role") == "tool" and m.get("tool_call_id") in orphaned_results)
-            ]
-            logger.debug(
-                "Pre-call sanitizer: removed %d orphaned tool result(s)",
-                len(orphaned_results),
-            )
-
-        # 2. Inject stub results for calls whose result was dropped
-        missing_results = surviving_call_ids - result_call_ids
-        if missing_results:
-            patched: List[Dict[str, Any]] = []
-            for msg in messages:
-                patched.append(msg)
-                if msg.get("role") == "assistant":
-                    for tc in msg.get("tool_calls") or []:
-                        cid = AIAgent._get_tool_call_id_static(tc)
-                        if cid in missing_results:
-                            patched.append({
-                                "role": "tool",
-                                "content": "[Result unavailable — see context summary above]",
-                                "tool_call_id": cid,
-                            })
-            messages = patched
-            logger.debug(
-                "Pre-call sanitizer: added %d stub tool result(s)",
-                len(missing_results),
-            )
-        return messages
+        """Back-compat shim — real implementation lives in agent.message_sanitizer (F-L1)."""
+        from agent.message_sanitizer import sanitize_api_messages
+        return sanitize_api_messages(messages)
 
     @staticmethod
     def _cap_delegate_task_calls(tool_calls: list) -> list:
-        """Truncate excess delegate_task calls to MAX_CONCURRENT_CHILDREN.
-
-        The delegate_tool caps the task list inside a single call, but the
-        model can emit multiple separate delegate_task tool_calls in one
-        turn.  This truncates the excess, preserving all non-delegate calls.
-
-        Returns the original list if no truncation was needed.
-        """
-        from tools.delegate_tool import MAX_CONCURRENT_CHILDREN
-        delegate_count = sum(1 for tc in tool_calls if tc.function.name == "delegate_task")
-        if delegate_count <= MAX_CONCURRENT_CHILDREN:
-            return tool_calls
-        kept_delegates = 0
-        truncated = []
-        for tc in tool_calls:
-            if tc.function.name == "delegate_task":
-                if kept_delegates < MAX_CONCURRENT_CHILDREN:
-                    truncated.append(tc)
-                    kept_delegates += 1
-            else:
-                truncated.append(tc)
-        logger.warning(
-            "Truncated %d excess delegate_task call(s) to enforce "
-            "MAX_CONCURRENT_CHILDREN=%d limit",
-            delegate_count - MAX_CONCURRENT_CHILDREN, MAX_CONCURRENT_CHILDREN,
-        )
-        return truncated
+        """Back-compat shim — real implementation lives in agent.message_sanitizer (F-L1)."""
+        from agent.message_sanitizer import cap_delegate_task_calls
+        return cap_delegate_task_calls(tool_calls)
 
     @staticmethod
     def _deduplicate_tool_calls(tool_calls: list) -> list:
-        """Remove duplicate (tool_name, arguments) pairs within a single turn.
-
-        Only the first occurrence of each unique pair is kept.
-        Returns the original list if no duplicates were found.
-        """
-        seen: set = set()
-        unique: list = []
-        for tc in tool_calls:
-            key = (tc.function.name, tc.function.arguments)
-            if key not in seen:
-                seen.add(key)
-                unique.append(tc)
-            else:
-                logger.warning("Removed duplicate tool call: %s", tc.function.name)
-        return unique if len(unique) < len(tool_calls) else tool_calls
+        """Back-compat shim — real implementation lives in agent.message_sanitizer (F-L1)."""
+        from agent.message_sanitizer import deduplicate_tool_calls
+        return deduplicate_tool_calls(tool_calls)
 
     def _repair_tool_call(self, tool_name: str) -> str | None:
         """Attempt to repair a mismatched tool name before aborting.
@@ -6995,6 +6982,7 @@ class AIAgent:
                 messages,
                 system_prompt=active_system_prompt or "",
                 tools=self.tools or None,
+                model=self.model,
             )
 
             if _preflight_tokens >= self.context_compressor.threshold_tokens:
@@ -7098,6 +7086,27 @@ class AIAgent:
             if not self.iteration_budget.consume():
                 if not self.quiet_mode:
                     self._safe_print(f"\n⚠️  Iteration budget exhausted ({self.iteration_budget.used}/{self.iteration_budget.max_total} iterations used)")
+                break
+
+            # F-H1 session cost ceiling. Check BEFORE the API call so we never
+            # issue the call that would push spend past the cap. The
+            # accumulator reflects cost of prior calls in this session only,
+            # so the first call is always permitted regardless of cap.
+            if self.session_cost_cap_usd and self.session_estimated_cost_usd >= self.session_cost_cap_usd:
+                if not self.quiet_mode:
+                    self._safe_print(
+                        f"\n⛔ Session cost cap reached: "
+                        f"${self.session_estimated_cost_usd:.4f} of ${self.session_cost_cap_usd:.2f} cap. "
+                        "Set HERMES_SESSION_COST_CAP_USD higher or unset to continue."
+                    )
+                logger.warning(
+                    "F-H1 cost cap reached on session %s: spent=$%.4f cap=$%.2f api_call=%d",
+                    self.session_id, self.session_estimated_cost_usd,
+                    self.session_cost_cap_usd, api_call_count,
+                )
+                # Refund the iteration we just consumed — we didn't actually use it.
+                self.iteration_budget.refund()
+                api_call_count -= 1
                 break
 
             # Fire step_callback for gateway hooks (agent:step event)

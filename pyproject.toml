@@ -32,6 +32,7 @@ dependencies = [
   "firecrawl-py>=4.16.0,<5",
   "parallel-web>=0.4.2,<1",
   "fal-client>=0.13.1,<1",
+  "pydub>=0.25.1,<1",
   # Text-to-speech (Edge TTS is free, no API key needed)
   "edge-tts>=7.2.7,<8",
   # Skills Hub (GitHub App JWT auth — optional, only needed for bot identity)
@@ -110,8 +111,19 @@ include = ["agent", "tools", "tools.*", "hermes_cli", "gateway", "gateway.*", "c
 testpaths = ["tests"]
 markers = [
     "integration: marks tests requiring external services (API keys, Modal, etc.)",
+    # F-L2 audit quarantine. Tests marked @pytest.mark.quarantine are
+    # known pre-existing failures or flakes tracked for remediation. The
+    # gated CI job runs with these EXCLUDED so new regressions cannot hide
+    # under this marker. A separate informational CI job runs `-m quarantine`
+    # and is allowed to fail until the drift is fully drained.
+    #
+    # Policy:
+    #   - Do NOT add this marker to new tests.
+    #   - When marking an existing test, add an issue link to its docstring.
+    #   - Budget 2h/week to drain the quarantine folder until empty.
+    "quarantine: pre-existing failing tests tracked for remediation (F-L2)",
 ]
-addopts = "-m 'not integration' -n auto"
+addopts = "-m 'not integration and not quarantine' -n auto"
 
 [tool.mypy]
 # Opt-in type checking. Start with strict-optional on critical paths

@@ -31,12 +31,46 @@ jobs:
           source .venv/bin/activate
           uv pip install -e ".[all,dev]"
 
-      - name: Run tests
+      - name: Run tests (gated — integration and quarantine excluded)
         run: |
           source .venv/bin/activate
+          # The pyproject `addopts` already includes `-m "not integration and not quarantine"`.
           python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short -n auto
         env:
           # Ensure tests don't accidentally call real APIs
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+
+  quarantine:
+    # F-L2: informational job. Runs the known-failing/flaky suite so the
+    # drift is visible in the CI UI without blocking merges. Drain over time.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: |
+          uv venv .venv --python 3.11
+          source .venv/bin/activate
+          uv pip install -e ".[all,dev]"
+
+      - name: Run quarantined tests (non-gating)
+        run: |
+          source .venv/bin/activate
+          # Override addopts so we specifically include quarantine this time.
+          python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e \
+            --tb=short -n auto -o 'addopts=' -m 'quarantine'
+        env:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""

@@ -10,15 +10,69 @@ Log files produced:
 
 Both files use ``RotatingFileHandler`` with ``RedactingFormatter`` so
 secrets are never written to disk.
+
+F-M4 request correlation: a ``request_id`` contextvar is threaded through
+the gateway entry points (``X-Hermes-Request-Id`` header, echoed back in
+responses). Log records emitted inside a bound context get the id stamped
+via ``RequestIdFilter``, so grepping the log file for the id returns the
+full trace of one request across tools, subagents, compression, etc.
 """
 
 import logging
 import os
+import uuid
+from contextvars import ContextVar
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
+
+from contextlib import contextmanager
 
 from hermes_constants import get_hermes_home
+
+
+# F-M4: request-id correlation. Contextvar so nested async tasks and
+# threaded tool handlers inherit the active request id automatically.
+_request_id: ContextVar[str] = ContextVar("hermes_request_id", default="")
+
+
+def generate_request_id() -> str:
+    """Return a short url-safe id for a new request. 12 hex chars is enough
+    to disambiguate within a single log file; smaller than a full uuid4 so
+    grep output stays scannable."""
+    return uuid.uuid4().hex[:12]
+
+
+def get_request_id() -> str:
+    """Return the request id bound to the current context, or empty string."""
+    return _request_id.get()
+
+
+@contextmanager
+def bind_request_id(request_id: Optional[str] = None) -> Iterator[str]:
+    """Bind ``request_id`` for the duration of the context.
+
+    If ``request_id`` is None/empty, a fresh id is generated. Yields the
+    effective id so callers can echo it in response headers.
+    """
+    rid = request_id or generate_request_id()
+    token = _request_id.set(rid)
+    try:
+        yield rid
+    finally:
+        _request_id.reset(token)
+
+
+class RequestIdFilter(logging.Filter):
+    """Inject the current ``request_id`` into every LogRecord.
+
+    Records outside a bound context get an empty string, which formats as
+    nothing when the format string uses ``%(request_id)s``.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: D401
+        record.request_id = _request_id.get() or "-"
+        return True
 
 # Sentinel to track whether setup_logging() has already run.  The function
 # is idempotent — calling it twice is safe but the second call is a no-op
@@ -26,8 +80,11 @@ from hermes_constants import get_hermes_home
 _logging_initialized = False
 
 # Default log format — includes timestamp, level, logger name, and message.
-_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
-_LOG_FORMAT_VERBOSE = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+# F-M4: include request_id so gateway traces can be reconstructed by grep.
+# When no request is in context the filter stamps "-" (reads as visually
+# absent without breaking fixed-width column layout).
+_LOG_FORMAT = "%(asctime)s %(levelname)s [req=%(request_id)s] %(name)s: %(message)s"
+_LOG_FORMAT_VERBOSE = "%(asctime)s [req=%(request_id)s] %(name)s %(levelname)s: %(message)s"
 
 # Third-party loggers that are noisy at DEBUG/INFO level.
 _NOISY_LOGGERS = (
@@ -181,6 +238,7 @@ def setup_verbose_logging() -> None:
     handler.setLevel(logging.DEBUG)
     handler.setFormatter(RedactingFormatter(_LOG_FORMAT_VERBOSE, datefmt="%H:%M:%S"))
     handler._hermes_verbose = True  # type: ignore[attr-defined]
+    handler.addFilter(RequestIdFilter())  # F-M4
     root.addHandler(handler)
 
     # Lower root logger level so DEBUG records reach all handlers.
@@ -224,6 +282,8 @@ def _add_rotating_handler(
     )
     handler.setLevel(level)
     handler.setFormatter(formatter)
+    # F-M4: stamp request_id onto every record routed to this handler.
+    handler.addFilter(RequestIdFilter())
     logger.addHandler(handler)
 
 

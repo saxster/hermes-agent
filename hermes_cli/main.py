@@ -553,120 +553,10 @@ def _resolve_session_by_name_or_id(name_or_id: str) -> Optional[str]:
     return None
 
 
-def cmd_chat(args):
-    """Run interactive chat CLI."""
-    # Resolve --continue into --resume with the latest CLI session or by name
-    continue_val = getattr(args, "continue_last", None)
-    if continue_val and not getattr(args, "resume", None):
-        if isinstance(continue_val, str):
-            # -c "session name" — resolve by title or ID
-            resolved = _resolve_session_by_name_or_id(continue_val)
-            if resolved:
-                args.resume = resolved
-            else:
-                print(f"No session found matching '{continue_val}'.")
-                print("Use 'hermes sessions list' to see available sessions.")
-                sys.exit(1)
-        else:
-            # -c with no argument — continue the most recent session
-            last_id = _resolve_last_cli_session()
-            if last_id:
-                args.resume = last_id
-            else:
-                print("No previous CLI session found to continue.")
-                sys.exit(1)
-
-    # Resolve --resume by title if it's not a direct session ID
-    resume_val = getattr(args, "resume", None)
-    if resume_val:
-        resolved = _resolve_session_by_name_or_id(resume_val)
-        if resolved:
-            args.resume = resolved
-        # If resolution fails, keep the original value — _init_agent will
-        # report "Session not found" with the original input
-
-    # First-run guard: check if any provider is configured before launching
-    if not _has_any_provider_configured():
-        print()
-        print("It looks like Hermes isn't configured yet -- no API keys or providers found.")
-        print()
-        print("  Run:  hermes setup")
-        print()
-
-        from hermes_cli.setup import is_interactive_stdin, print_noninteractive_setup_guidance
-
-        if not is_interactive_stdin():
-            print_noninteractive_setup_guidance(
-                "No interactive TTY detected for the first-run setup prompt."
-            )
-            sys.exit(1)
-
-        try:
-            reply = input("Run setup now? [Y/n] ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            reply = "n"
-        if reply in ("", "y", "yes"):
-            cmd_setup(args)
-            return
-        print()
-        print("You can run 'hermes setup' at any time to configure.")
-        sys.exit(1)
-
-    # Start update check in background (runs while other init happens)
-    try:
-        from hermes_cli.banner import prefetch_update_check
-        prefetch_update_check()
-    except Exception:
-        pass
-
-    # Sync bundled skills on every CLI launch (fast -- skips unchanged skills)
-    try:
-        from tools.skills_sync import sync_skills
-        sync_skills(quiet=True)
-    except Exception:
-        pass
-
-    # --yolo: bypass all dangerous command approvals
-    if getattr(args, "yolo", False):
-        os.environ["HERMES_YOLO_MODE"] = "1"
-
-    # --source: tag session source for filtering (e.g. 'tool' for third-party integrations)
-    if getattr(args, "source", None):
-        os.environ["HERMES_SESSION_SOURCE"] = args.source
-
-    # Import and run the CLI
-    from cli import main as cli_main
-    
-    # Build kwargs from args
-    kwargs = {
-        "model": args.model,
-        "provider": getattr(args, "provider", None),
-        "toolsets": args.toolsets,
-        "skills": getattr(args, "skills", None),
-        "verbose": args.verbose,
-        "quiet": getattr(args, "quiet", False),
-        "query": args.query,
-        "resume": getattr(args, "resume", None),
-        "worktree": getattr(args, "worktree", False),
-        "checkpoints": getattr(args, "checkpoints", False),
-        "pass_session_id": getattr(args, "pass_session_id", False),
-        "max_turns": getattr(args, "max_turns", None),
-        "council": getattr(args, "council", None),
-    }
-    # Filter out None values
-    kwargs = {k: v for k, v in kwargs.items() if v is not None}
-    
-    try:
-        cli_main(**kwargs)
-    except ValueError as e:
-        print(f"Error: {e}")
-        sys.exit(1)
+from hermes_cli.cmd_handlers.chat_handler import cmd_chat  # noqa: E402,F401
 
 
-def cmd_gateway(args):
-    """Gateway management commands."""
-    from hermes_cli.gateway import gateway_command
-    gateway_command(args)
+from hermes_cli.cmd_handlers.gateway_handler import cmd_gateway  # noqa: E402,F401
 
 
 def cmd_whatsapp(args):
@@ -856,12 +746,7 @@ def cmd_whatsapp(args):
         print("⚠ Pairing may not have completed. Run 'hermes whatsapp' to try again.")
 
 
-def cmd_setup(args):
-    """Interactive setup wizard."""
-    if not getattr(args, 'non_interactive', False):
-        _require_tty("setup")
-    from hermes_cli.setup import run_setup_wizard
-    run_setup_wizard(args)
+from hermes_cli.cmd_handlers.setup_handler import cmd_setup  # noqa: E402,F401
 
 
 def cmd_model(args):
@@ -2548,6 +2433,18 @@ def cmd_webhook(args):
     webhook_command(args)
 
 
+def cmd_dashboard(args):
+    """Start the local web dashboard."""
+    from hermes_cli.web_server import start_server
+
+    start_server(
+        host=getattr(args, "host", "127.0.0.1"),
+        port=getattr(args, "port", 9119),
+        open_browser=not getattr(args, "no_open", False),
+        allow_public=getattr(args, "insecure", False),
+    )
+
+
 def cmd_doctor(args):
     """Check configuration and dependencies."""
     from hermes_cli.doctor import run_doctor
@@ -3462,242 +3359,8 @@ def _coalesce_session_name_args(argv: list) -> list:
     return result
 
 
-def cmd_profile(args):
-    """Profile management — create, delete, list, switch, alias."""
-    from hermes_cli.profiles import (
-        list_profiles, create_profile, delete_profile, seed_profile_skills,
-        get_active_profile, set_active_profile, get_active_profile_name,
-        check_alias_collision, create_wrapper_script, remove_wrapper_script,
-        _is_wrapper_dir_in_path, _get_wrapper_dir,
-    )
-    from hermes_constants import display_hermes_home
-
-    action = getattr(args, "profile_action", None)
-
-    if action is None:
-        # Bare `hermes profile` — show current profile status
-        profile_name = get_active_profile_name()
-        dhh = display_hermes_home()
-        print(f"\nActive profile: {profile_name}")
-        print(f"Path:           {dhh}")
-
-        profiles = list_profiles()
-        for p in profiles:
-            if p.name == profile_name or (profile_name == "default" and p.is_default):
-                if p.model:
-                    print(f"Model:          {p.model}" + (f" ({p.provider})" if p.provider else ""))
-                print(f"Gateway:        {'running' if p.gateway_running else 'stopped'}")
-                print(f"Skills:         {p.skill_count} installed")
-                if p.alias_path:
-                    print(f"Alias:          {p.name} → hermes -p {p.name}")
-                break
-        print()
-        return
-
-    if action == "list":
-        profiles = list_profiles()
-        active = get_active_profile_name()
-
-        if not profiles:
-            print("No profiles found.")
-            return
-
-        # Header
-        print(f"\n {'Profile':<16} {'Model':<28} {'Gateway':<12} {'Alias'}")
-        print(f" {'─' * 15}    {'─' * 27}    {'─' * 11}    {'─' * 12}")
-
-        for p in profiles:
-            marker = " ◆" if (p.name == active or (active == "default" and p.is_default)) else "  "
-            name = p.name
-            model = (p.model or "—")[:26]
-            gw = "running" if p.gateway_running else "stopped"
-            alias = p.name if p.alias_path else "—"
-            if p.is_default:
-                alias = "—"
-            print(f"{marker}{name:<15} {model:<28} {gw:<12} {alias}")
-        print()
-
-    elif action == "use":
-        name = args.profile_name
-        try:
-            set_active_profile(name)
-            if name == "default":
-                print(f"Switched to: default (~/.hermes)")
-            else:
-                print(f"Switched to: {name}")
-        except (ValueError, FileNotFoundError) as e:
-            print(f"Error: {e}")
-            sys.exit(1)
-
-    elif action == "create":
-        name = args.profile_name
-        clone = getattr(args, "clone", False)
-        clone_all = getattr(args, "clone_all", False)
-        no_alias = getattr(args, "no_alias", False)
-
-        try:
-            clone_from = getattr(args, "clone_from", None)
-
-            profile_dir = create_profile(
-                name=name,
-                clone_from=clone_from,
-                clone_all=clone_all,
-                clone_config=clone,
-                no_alias=no_alias,
-            )
-            print(f"\nProfile '{name}' created at {profile_dir}")
-
-            if clone or clone_all:
-                source_label = getattr(args, "clone_from", None) or get_active_profile_name()
-                if clone_all:
-                    print(f"Full copy from {source_label}.")
-                else:
-                    print(f"Cloned config, .env, SOUL.md from {source_label}.")
-
-            # Seed bundled skills (skip if --clone-all already copied them)
-            if not clone_all:
-                result = seed_profile_skills(profile_dir)
-                if result:
-                    copied = len(result.get("copied", []))
-                    print(f"{copied} bundled skills synced.")
-                else:
-                    print("⚠ Skills could not be seeded. Run `{} update` to retry.".format(name))
-
-            # Create wrapper alias
-            if not no_alias:
-                collision = check_alias_collision(name)
-                if collision:
-                    print(f"\n⚠ Cannot create alias '{name}' — {collision}")
-                    print(f"  Choose a custom alias:  hermes profile alias {name} --name <custom>")
-                    print(f"  Or access via flag:     hermes -p {name} chat")
-                else:
-                    wrapper_path = create_wrapper_script(name)
-                    if wrapper_path:
-                        print(f"Wrapper created: {wrapper_path}")
-                        if not _is_wrapper_dir_in_path():
-                            print(f"\n⚠ {_get_wrapper_dir()} is not in your PATH.")
-                            print(f'  Add to your shell config (~/.bashrc or ~/.zshrc):')
-                            print(f'    export PATH="$HOME/.local/bin:$PATH"')
-
-            # Next steps
-            print(f"\nNext steps:")
-            print(f"  {name} setup              Configure API keys and model")
-            print(f"  {name} chat               Start chatting")
-            print(f"  {name} gateway start      Start the messaging gateway")
-            if clone or clone_all:
-                from hermes_constants import get_hermes_home
-                profile_dir_display = f"~/.hermes/profiles/{name}"
-                print(f"\n  Edit {profile_dir_display}/.env for different API keys")
-                print(f"  Edit {profile_dir_display}/SOUL.md for different personality")
-            print()
-
-        except (ValueError, FileExistsError, FileNotFoundError) as e:
-            print(f"Error: {e}")
-            sys.exit(1)
-
-    elif action == "delete":
-        name = args.profile_name
-        yes = getattr(args, "yes", False)
-        try:
-            delete_profile(name, yes=yes)
-        except (ValueError, FileNotFoundError) as e:
-            print(f"Error: {e}")
-            sys.exit(1)
-
-    elif action == "show":
-        name = args.profile_name
-        from hermes_cli.profiles import get_profile_dir, profile_exists, _read_config_model, _check_gateway_running, _count_skills
-        if not profile_exists(name):
-            print(f"Error: Profile '{name}' does not exist.")
-            sys.exit(1)
-        profile_dir = get_profile_dir(name)
-        model, provider = _read_config_model(profile_dir)
-        gw = _check_gateway_running(profile_dir)
-        skills = _count_skills(profile_dir)
-        wrapper = _get_wrapper_dir() / name
-
-        print(f"\nProfile: {name}")
-        print(f"Path:    {profile_dir}")
-        if model:
-            print(f"Model:   {model}" + (f" ({provider})" if provider else ""))
-        print(f"Gateway: {'running' if gw else 'stopped'}")
-        print(f"Skills:  {skills}")
-        print(f".env:    {'exists' if (profile_dir / '.env').exists() else 'not configured'}")
-        print(f"SOUL.md: {'exists' if (profile_dir / 'SOUL.md').exists() else 'not configured'}")
-        if wrapper.exists():
-            print(f"Alias:   {wrapper}")
-        print()
-
-    elif action == "alias":
-        name = args.profile_name
-        remove = getattr(args, "remove", False)
-        custom_name = getattr(args, "alias_name", None)
-
-        from hermes_cli.profiles import profile_exists
-        if not profile_exists(name):
-            print(f"Error: Profile '{name}' does not exist.")
-            sys.exit(1)
-
-        alias_name = custom_name or name
-
-        if remove:
-            if remove_wrapper_script(alias_name):
-                print(f"✓ Removed alias '{alias_name}'")
-            else:
-                print(f"No alias '{alias_name}' found to remove.")
-        else:
-            collision = check_alias_collision(alias_name)
-            if collision:
-                print(f"Error: {collision}")
-                sys.exit(1)
-            wrapper_path = create_wrapper_script(alias_name)
-            if wrapper_path:
-                # If custom name, write the profile name into the wrapper
-                if custom_name:
-                    wrapper_path.write_text(f'#!/bin/sh\nexec hermes -p {name} "$@"\n')
-                print(f"✓ Alias created: {wrapper_path}")
-                if not _is_wrapper_dir_in_path():
-                    print(f"⚠ {_get_wrapper_dir()} is not in your PATH.")
-
-    elif action == "rename":
-        from hermes_cli.profiles import rename_profile
-        try:
-            new_dir = rename_profile(args.old_name, args.new_name)
-            print(f"\nProfile renamed: {args.old_name} → {args.new_name}")
-            print(f"Path: {new_dir}\n")
-        except (ValueError, FileExistsError, FileNotFoundError) as e:
-            print(f"Error: {e}")
-            sys.exit(1)
-
-    elif action == "export":
-        from hermes_cli.profiles import export_profile
-        name = args.profile_name
-        output = args.output or f"{name}.tar.gz"
-        try:
-            result_path = export_profile(name, output)
-            print(f"✓ Exported '{name}' to {result_path}")
-        except (ValueError, FileNotFoundError) as e:
-            print(f"Error: {e}")
-            sys.exit(1)
-
-    elif action == "import":
-        from hermes_cli.profiles import import_profile
-        try:
-            profile_dir = import_profile(args.archive, name=getattr(args, "import_name", None))
-            name = profile_dir.name
-            print(f"✓ Imported profile '{name}' at {profile_dir}")
-
-            # Offer to create alias
-            collision = check_alias_collision(name)
-            if not collision:
-                wrapper_path = create_wrapper_script(name)
-                if wrapper_path:
-                    print(f"  Wrapper created: {wrapper_path}")
-            print()
-        except (ValueError, FileExistsError, FileNotFoundError) as e:
-            print(f"Error: {e}")
-            sys.exit(1)
-
+# cmd_profile extracted to hermes_cli/cmd_handlers/profile_handler.py (F-C1 step 1).
+from hermes_cli.cmd_handlers.profile_handler import cmd_profile  # noqa: E402,F401
 
 def cmd_completion(args):
     """Print shell completion script."""
@@ -4200,6 +3863,21 @@ For more help on a command:
         help="Emit a machine-readable JSON snapshot"
     )
     status_parser.set_defaults(func=cmd_status)
+
+    # =========================================================================
+    # dashboard command
+    # =========================================================================
+    dashboard_parser = subparsers.add_parser(
+        "dashboard",
+        aliases=["web"],
+        help="Start the local web dashboard",
+        description="Launch the Hermes Agent web dashboard for local config, provider, and session status",
+    )
+    dashboard_parser.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
+    dashboard_parser.add_argument("--port", type=int, default=9119, help="Bind port (default: 9119)")
+    dashboard_parser.add_argument("--no-open", action="store_true", help="Do not open a browser window")
+    dashboard_parser.add_argument("--insecure", action="store_true", help="Allow non-localhost binds")
+    dashboard_parser.set_defaults(func=cmd_dashboard)
     
     # =========================================================================
     # cron command
@@ -4444,15 +4122,7 @@ For more help on a command:
     # config sub-action: interactive enable/disable
     skills_subparsers.add_parser("config", help="Interactive skill configuration — enable/disable individual skills")
 
-    def cmd_skills(args):
-        # Route 'config' action to skills_config module
-        if getattr(args, 'skills_action', None) == 'config':
-            _require_tty("skills config")
-            from hermes_cli.skills_config import skills_command as skills_config_command
-            skills_config_command(args)
-        else:
-            from hermes_cli.skills_hub import skills_command
-            skills_command(args)
+    from hermes_cli.cmd_handlers.skills_handler import cmd_skills  # noqa: E402,F401
 
     skills_parser.set_defaults(func=cmd_skills)
 
@@ -4588,9 +4258,7 @@ For more help on a command:
         help="Step-by-step migration guide from openclaw-honcho to Hermes Honcho",
     )
 
-    def cmd_honcho(args):
-        from honcho_integration.cli import honcho_command
-        honcho_command(args)
+    from hermes_cli.cmd_handlers.honcho_handler import cmd_honcho  # noqa: E402,F401
 
     honcho_parser.set_defaults(func=cmd_honcho)
 
@@ -4652,15 +4320,7 @@ For more help on a command:
         help="Platform to apply to (default: cli)",
     )
 
-    def cmd_tools(args):
-        action = getattr(args, "tools_action", None)
-        if action in ("list", "disable", "enable"):
-            from hermes_cli.tools_config import tools_disable_enable_command
-            tools_disable_enable_command(args)
-        else:
-            _require_tty("tools")
-            from hermes_cli.tools_config import tools_command
-            tools_command(args)
+    from hermes_cli.cmd_handlers.tools_handler import cmd_tools  # noqa: E402,F401
 
     tools_parser.set_defaults(func=cmd_tools)
     # =========================================================================
