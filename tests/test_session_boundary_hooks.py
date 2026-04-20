@@ -20,6 +20,14 @@ def test_session_finalize_on_reset(mock_invoke_hook):
     cli.agent = MagicMock()
     cli.agent.session_id = "test-session-id"
 
+    # In real code, ``prepare_for_session_switch`` rebinds the agent's
+    # session_id attribute — MagicMock doesn't do that automatically, so
+    # simulate it so the on_session_reset hook sees the new id.
+    def _prepare_side_effect(new_session_id, **_kwargs):
+        cli.agent.session_id = new_session_id
+
+    cli.agent.prepare_for_session_switch.side_effect = _prepare_side_effect
+
     # Simulate /new command which triggers on_session_finalize for the old session
     cli.new_session(silent=True)
 
