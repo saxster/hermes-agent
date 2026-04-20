@@ -6,7 +6,7 @@
 openai
 python-dotenv
 fire
-httpx
+httpx[socks]
 rich
 tenacity
 prompt_toolkit
@@ -17,6 +17,7 @@ pydantic>=2.0
 PyJWT[crypto]
 debugpy
 opendataloader-pdf>=2.0.0
+pydub
 
 # Web tools
 firecrawl-py
@@ -32,6 +33,14 @@ edge-tts
 croniter
 
 # Optional: For messaging platform integrations (gateway)
-python-telegram-bot>=20.0
-discord.py>=2.0
+python-telegram-bot[webhooks]>=22.6
+discord.py[voice]>=2.7.1
 aiohttp>=3.9.0
+qrcode>=7.0
+
+# Optional local web dashboard
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
+# Optional provider integrations
+boto3>=1.35.0
