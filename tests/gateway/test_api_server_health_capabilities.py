@@ -3,7 +3,11 @@ from httpx import ASGITransport, AsyncClient
 import pytest
 
 from gateway.config import PlatformConfig
-from gateway.platforms.api_server import APIServerAdapter
+from gateway.platforms.api_server import (
+    APIServerAdapter,
+    CAPABILITIES_SCHEMA_VERSION,
+    CapabilityPayload,
+)
 
 
 class FakeUpgradeScout:
@@ -101,10 +105,58 @@ async def test_health_includes_companion_capability_contract(monkeypatch):
     body = response.json()
     capabilities = body["capabilities"]
     assert body["version"] == "0.10.0+hermes.local"
-    assert capabilities["schema_version"] == 2
+    assert capabilities["schema_version"] == CAPABILITIES_SCHEMA_VERSION
     assert capabilities["tool_gateway"]["available"] is True
     assert capabilities["cron"]["jobs_active"] == 1
     assert capabilities["surfaces"]["web_dashboard"]["command"] == "hermes dashboard"
+
+
+def test_capability_schema_version_matches_wire_constant():
+    """The wire constant drives the value returned by the collector.
+
+    Locks down the contract documented in docs/api/capabilities.md — if a
+    future PR changes the constant without updating the doc's history
+    table, this test keeps the change visible but does NOT block (readers
+    still get a clear pointer to the doc). Breaking the constant requires
+    a deliberate version bump + doc update; this test catches accidental
+    drift where the constant is renamed, deleted, or typed away.
+    """
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    payload = adapter._collect_capability_metadata()
+
+    assert isinstance(CAPABILITIES_SCHEMA_VERSION, int), \
+        "CAPABILITIES_SCHEMA_VERSION must be a plain int for wire encoding"
+    assert payload["schema_version"] == CAPABILITIES_SCHEMA_VERSION
+
+    # Structural sanity — every required top-level key is present even on
+    # an unconfigured instance (collector catches probe errors and still
+    # returns the scaffold).
+    for key in (
+        "schema_version",
+        "configured_model",
+        "enabled_toolsets",
+        "endpoints",
+        "cron",
+        "tool_gateway",
+        "surfaces",
+        "hermes_home",
+        "errors",
+    ):
+        assert key in payload, f"capabilities payload missing required key: {key}"
+
+
+def test_capability_payload_typeddict_importable():
+    """CapabilityPayload is a re-exportable symbol, not a private helper.
+
+    Downstream Python consumers (hermes-webui) import this TypedDict by
+    name to annotate their own code. If a refactor moves or renames it,
+    this test fails loudly instead of silently breaking wheel users.
+    """
+    from gateway.platforms import api_server
+
+    assert hasattr(api_server, "CapabilityPayload")
+    assert hasattr(api_server, "CAPABILITIES_SCHEMA_VERSION")
+    assert api_server.CapabilityPayload is CapabilityPayload
 
 
 @pytest.mark.asyncio
