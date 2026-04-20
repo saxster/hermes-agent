@@ -113,7 +113,12 @@ py-modules = ["run_agent", "model_tools", "toolsets", "batch_runner", "trajector
 hermes_cli = ["web_dist/**/*"]
 
 [tool.setuptools.packages.find]
-include = ["agent", "tools", "tools.*", "hermes_cli", "gateway", "gateway.*", "cron", "honcho_integration", "acp_adapter", "plugins", "plugins.*"]
+# `.*` suffixes are required for any package that has subpackages — otherwise
+# setuptools skips them. F-C1/C2/C3 introduced hermes_cli.cmd_handlers,
+# hermes_cli.auth, and agent.auxiliary without updating the include list,
+# so `pip install dist/*.whl` fails on `from hermes_cli.cmd_handlers...`
+# until both roots pick up their `.*` companion entry.
+include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*", "gateway", "gateway.*", "cron", "honcho_integration", "acp_adapter", "plugins", "plugins.*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
