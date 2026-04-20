@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.local
+.DS_Store
+
+# Vite
+.vite/
+
+# Env
+.env
+.env.local
+.env.*.local
