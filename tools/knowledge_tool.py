@@ -35,6 +35,63 @@ from agent.guardrails import scan_content as _scan_content
 _VALID_ENTITY_TYPES = {"note", "person", "project", "decision"}
 
 
+# ---------------------------------------------------------------------------
+# F-D1 Phase 3 — KnowledgeRouter integration (feature-flagged)
+# ---------------------------------------------------------------------------
+#
+# When ``knowledge.routing.enabled`` is on in config, two new behaviors
+# activate:
+#   1. The ``search_all_layers`` action performs a cross-store search
+#      via ``agent.knowledge_router.KnowledgeRouter`` (wiki + graph +
+#      structured rows, fused with reciprocal-rank fusion).
+#   2. The four ``save_*`` actions propagate a shared external ID
+#      (via ``agent.knowledge_external_id.knowledge_external_id``) into
+#      the saved row's tags, making the new row joinable with wiki
+#      pages + graph nodes written through the router.
+#
+# Flag off: existing behavior is unchanged. No call path through the
+# router, no external-ID tags, no schema difference. The flag is
+# checked at every call so a config reload is picked up without
+# restarting.
+
+def _knowledge_routing_enabled() -> bool:
+    """Return True when the F-D1 routing feature flag is on.
+
+    Read the config each call (cheap) so flag flips during a running
+    session take effect on the next tool invocation. Any exception
+    (config file missing, malformed, etc.) degrades to ``False`` so
+    the tool never crashes on a config-layer problem.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+        routing = ((config.get("knowledge") or {}).get("routing") or {})
+        return bool(routing.get("enabled", False))
+    except Exception:
+        return False
+
+
+def _external_id_tag(kind: str, name: str) -> Optional[str]:
+    """Return an ``external_id:<id>`` tag string for a save_* action.
+
+    ``kind`` must be one of the ``KNOWLEDGE_KINDS`` — for this tool we
+    map ``save_note`` → ``"note"``, ``save_person`` → ``"person"``,
+    ``save_project`` → ``"project"``, ``save_decision`` → ``"decision"``.
+    ``name`` is the entity's identifying field. Returns ``None`` if the
+    ID can't be computed (empty name, unknown kind, etc.) — callers
+    should skip the tag injection rather than crash.
+    """
+    try:
+        from agent.knowledge_external_id import knowledge_external_id
+
+        ext_id = knowledge_external_id(kind, name)
+        return f"external_id:{ext_id}"
+    except Exception as exc:
+        logger.debug("knowledge_external_id skipped: %s", exc)
+        return None
+
+
 async def knowledge_tool(
     action: str,
     content: str = None,
@@ -76,7 +133,17 @@ async def knowledge_tool(
         threat = _scan_content(content)
         if threat:
             return json.dumps({"success": False, "error": threat})
-        
+
+        # F-D1 Phase 3: inject external_id tag when routing is on so
+        # the new row is joinable with wiki/graph entries for the same
+        # conceptual entity. The seed is the note's first line (what
+        # knowledge_router uses).
+        if _knowledge_routing_enabled():
+            note_seed = (content.strip().splitlines()[0] if content.strip() else "")[:80]
+            ext_tag = _external_id_tag("note", note_seed) if note_seed else None
+            if ext_tag and ext_tag not in tag_list:
+                tag_list = tag_list + [ext_tag]
+
         if knowledge_manager:
             note_id = knowledge_manager.save_note(
                 content=content, tags=tag_list, session_id=session_id
@@ -86,7 +153,7 @@ async def knowledge_tool(
                 content=content, tags=tag_list,
                 source="conversation", session_id=session_id,
             )
-            
+
         return json.dumps({
             "success": True, "action": "save_note",
             "id": note_id, "tags": tag_list,
@@ -101,7 +168,12 @@ async def knowledge_tool(
                 threat = _scan_content(field)
                 if threat:
                     return json.dumps({"success": False, "error": threat})
-        
+
+        if _knowledge_routing_enabled():
+            ext_tag = _external_id_tag("person", name)
+            if ext_tag and ext_tag not in tag_list:
+                tag_list = tag_list + [ext_tag]
+
         if knowledge_manager:
             person_id = knowledge_manager.save_person(
                 name=name, role=role, organization=organization,
@@ -127,7 +199,12 @@ async def knowledge_tool(
                 threat = _scan_content(field)
                 if threat:
                     return json.dumps({"success": False, "error": threat})
-        
+
+        if _knowledge_routing_enabled():
+            ext_tag = _external_id_tag("project", name)
+            if ext_tag and ext_tag not in tag_list:
+                tag_list = tag_list + [ext_tag]
+
         if knowledge_manager:
             project_id = knowledge_manager.save_project(
                 name=name, description=description,
@@ -153,7 +230,12 @@ async def knowledge_tool(
                 threat = _scan_content(field)
                 if threat:
                     return json.dumps({"success": False, "error": threat})
-        
+
+        if _knowledge_routing_enabled():
+            ext_tag = _external_id_tag("decision", title)
+            if ext_tag and ext_tag not in tag_list:
+                tag_list = tag_list + [ext_tag]
+
         if knowledge_manager:
             decision_id = knowledge_manager.save_decision(
                 title=title, rationale=rationale,
@@ -185,6 +267,97 @@ async def knowledge_tool(
             "success": True, "action": "search",
             "count": len(results), "results": results,
         })
+
+    elif action == "search_all_layers":
+        # F-D1 Phase 3: cross-store search via KnowledgeRouter. Hits
+        # the wiki + context graph + structured store in parallel and
+        # fuses results with reciprocal-rank fusion. When the routing
+        # flag is off, gracefully falls back to the SQLite-only search
+        # so the action is always callable — just with a layer-scoped
+        # result set when routing is disabled.
+        if not query:
+            return json.dumps({
+                "success": False,
+                "error": "query is required for search_all_layers"
+            })
+
+        if not _knowledge_routing_enabled():
+            # Flag off — degrade to structured-only search and tag the
+            # response so the caller can see why the result set is narrower.
+            results = session_db.search_knowledge(
+                query=query, entity_type=None, tag=None, limit=limit,
+            )
+            return json.dumps({
+                "success": True, "action": "search_all_layers",
+                "routing_enabled": False,
+                "layers_searched": ["structured"],
+                "count": len(results),
+                "results": results,
+                "note": (
+                    "knowledge.routing.enabled is off in config — "
+                    "falling back to structured-only search. Enable routing to "
+                    "include the wiki + context graph layers."
+                ),
+            })
+
+        # Flag on — full cross-layer search.
+        try:
+            from agent.knowledge_router import KnowledgeRouter
+            from tools.kb_tool import kb_tool as _kb_tool_fn, check_kb_requirements
+
+            kb_callable = _kb_tool_fn if check_kb_requirements() else None
+
+            graph_manager = None
+            try:
+                # GraphManager is optional; context_graph tool's
+                # initialization does the heavy lifting when available.
+                from tools.context_graph_tool import _get_graph_manager
+                graph_manager = _get_graph_manager()
+            except Exception as exc:
+                logger.debug("GraphManager unavailable for search_all_layers: %s", exc)
+
+            router = KnowledgeRouter(
+                knowledge_manager=knowledge_manager,
+                graph_manager=graph_manager,
+                kb_tool_fn=kb_callable,
+            )
+            hits = router.search(query=query, limit=limit)
+            layers_searched = [
+                layer for layer, present in (
+                    ("structured", knowledge_manager is not None),
+                    ("graph", graph_manager is not None),
+                    ("wiki", kb_callable is not None),
+                ) if present
+            ]
+            return json.dumps({
+                "success": True, "action": "search_all_layers",
+                "routing_enabled": True,
+                "layers_searched": layers_searched,
+                "count": len(hits),
+                "results": [
+                    {
+                        "source_layer": h.source_layer,
+                        "title": h.title,
+                        "snippet": h.snippet,
+                        "score": round(h.score, 6),
+                        "external_id": h.external_id,
+                    }
+                    for h in hits
+                ],
+            })
+        except Exception as exc:
+            logger.warning("search_all_layers failed, falling back: %s", exc)
+            results = session_db.search_knowledge(
+                query=query, entity_type=None, tag=None, limit=limit,
+            )
+            return json.dumps({
+                "success": True, "action": "search_all_layers",
+                "routing_enabled": True,
+                "layers_searched": ["structured"],
+                "count": len(results),
+                "results": results,
+                "fallback_reason": f"{type(exc).__name__}: {exc}",
+            })
 
     elif action == "list":
         if not entity_type:
@@ -233,7 +406,7 @@ async def knowledge_tool(
     else:
         return json.dumps({
             "success": False,
-            "error": f"Unknown action '{action}'. Use: save_note, save_person, save_project, save_decision, search, list, ingest, sync"
+            "error": f"Unknown action '{action}'. Use: save_note, save_person, save_project, save_decision, search, search_all_layers, list, ingest, sync"
         })
 
 
@@ -263,6 +436,10 @@ KNOWLEDGE_SCHEMA = {
         "- save_project: Save/update a project (requires name)\n"
         "- save_decision: Record a decision (requires title, rationale)\n"
         "- search: Cross-table search by query text and/or tag\n"
+        "- search_all_layers: Cross-store search (structured + wiki + context graph). "
+        "When knowledge.routing.enabled is on, this is the recommended search action "
+        "for 'what do I know about X' questions — it hits all three stores and fuses "
+        "results. With the flag off, gracefully degrades to structured-only search.\n"
         "- list: List entities of a specific type\n"
         "- ingest: Manually trigger ingestion of your personal Obsidian notes into Hermes\n"
         "- sync: Export recent agent episodes/learnings to Obsidian\n\n"
@@ -276,7 +453,7 @@ KNOWLEDGE_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["save_note", "save_person", "save_project", "save_decision", "search", "list", "ingest", "sync"],
+                "enum": ["save_note", "save_person", "save_project", "save_decision", "search", "search_all_layers", "list", "ingest", "sync"],
                 "description": "The action to perform."
             },
             "content": {
