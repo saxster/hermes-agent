@@ -237,6 +237,16 @@ DEFAULT_CONFIG = {
         # episodes to Obsidian.
         "sync_episodes": False,
         "sync_interval": 3600,  # seconds
+        # F-D1 Phase 1-2 — Knowledge router (agent/knowledge_router.py).
+        # When enabled, a future `knowledge` agent tool will dispatch
+        # writes and cross-layer searches through the router rather
+        # than calling kb_tool / GraphManager / KnowledgeManager
+        # directly. Phase 2 scaffolding ships the module but wires no
+        # agent-facing integration; keep this off by default until
+        # Phase 3 lands.
+        "routing": {
+            "enabled": False,
+        },
     },
     
     "terminal": {
