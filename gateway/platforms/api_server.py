@@ -605,8 +605,136 @@ class APIServerAdapter(BasePlatformAdapter):
     # HTTP Handlers
     # ------------------------------------------------------------------
 
+    def _collect_capability_metadata(self) -> Dict[str, Any]:
+        """Return machine-readable local capabilities for desktop clients.
+
+        Keep this conservative and best-effort: `/health` must stay cheap and
+        should never fail just because an optional provider, dashboard, or
+        status probe is unavailable.
+        """
+        errors: List[str] = []
+        try:
+            from hermes_cli.config import load_config, get_hermes_home
+
+            config = load_config() or {}
+            hermes_home = get_hermes_home()
+        except Exception as exc:
+            config = {}
+            hermes_home = None
+            errors.append(f"config: {exc}")
+
+        try:
+            from gateway.run import _resolve_gateway_model
+
+            configured_model = _resolve_gateway_model()
+        except Exception:
+            model_cfg = config.get("model") if isinstance(config.get("model"), dict) else {}
+            configured_model = (
+                model_cfg.get("default") if isinstance(model_cfg, dict) else config.get("model")
+            ) or "auto"
+
+        try:
+            from hermes_cli.tools_config import _get_platform_tools
+
+            enabled_toolsets = sorted(_get_platform_tools(config, "api_server"))
+        except Exception as exc:
+            enabled_toolsets = []
+            errors.append(f"toolsets: {exc}")
+
+        try:
+            from hermes_cli.nous_subscription import get_nous_subscription_features
+
+            nous_features = get_nous_subscription_features(config)
+            tool_gateway = {
+                "available": bool(nous_features.nous_auth_present or nous_features.subscribed),
+                "provider_is_nous": bool(nous_features.provider_is_nous),
+                "features": [
+                    {
+                        "key": feature.key,
+                        "label": feature.label,
+                        "available": feature.available,
+                        "active": feature.active,
+                        "managed_by_nous": feature.managed_by_nous,
+                        "direct_override": feature.direct_override,
+                        "toolset_enabled": feature.toolset_enabled,
+                        "current_provider": feature.current_provider,
+                    }
+                    for feature in nous_features.items()
+                ],
+            }
+        except Exception as exc:
+            tool_gateway = {"available": False, "features": []}
+            errors.append(f"tool_gateway: {exc}")
+
+        try:
+            from hermes_cli.status import _collect_status_snapshot
+
+            status_snapshot = _collect_status_snapshot(show_all=False, deep=False)
+        except Exception as exc:
+            status_snapshot = {}
+            errors.append(f"status: {exc}")
+
+        try:
+            jobs = self._cron_list(include_disabled=True) if self._CRON_AVAILABLE else []
+            active_jobs = [job for job in jobs if job.get("enabled", True)]
+            cron_status = {
+                "available": bool(self._CRON_AVAILABLE),
+                "jobs_total": len(jobs),
+                "jobs_active": len(active_jobs),
+            }
+        except Exception as exc:
+            cron_status = {"available": bool(self._CRON_AVAILABLE), "jobs_total": 0, "jobs_active": 0}
+            errors.append(f"cron: {exc}")
+
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        web_dir = os.path.join(project_root, "web")
+        tui_dir = os.path.join(project_root, "ui-tui")
+        web_dist = os.path.join(project_root, "hermes_cli", "web_dist")
+
+        return {
+            "schema_version": 2,
+            "configured_model": configured_model,
+            "enabled_toolsets": enabled_toolsets,
+            "endpoints": [
+                "/health",
+                "/v1/chat/completions",
+                "/v1/responses",
+                "/v1/runs",
+                "/v1/runs/{run_id}/events",
+                "/v1/models",
+                "/api/jobs",
+                "/api/memory/search",
+                "/v1/approvals",
+                "/v1/media/synthesize",
+                "/v1/media/bundles",
+                "/v1/media/bundle/{bundle_id}",
+            ],
+            "providers": status_snapshot.get("providers", {}),
+            "messaging": status_snapshot.get("messaging", {"platforms": []}),
+            "gateway": status_snapshot.get("gateway", {}),
+            "cron": cron_status,
+            "tool_gateway": tool_gateway,
+            "surfaces": {
+                "classic_cli": {"available": True, "command": "hermes chat"},
+                "tui": {
+                    "available": os.path.isdir(tui_dir),
+                    "path": tui_dir,
+                    "command": "npm run start",
+                },
+                "web_dashboard": {
+                    "available": os.path.isdir(web_dir) or os.path.isdir(web_dist),
+                    "source_path": web_dir,
+                    "dist_path": web_dist,
+                    "command": "hermes dashboard",
+                    "default_url": "http://127.0.0.1:9119",
+                },
+            },
+            "hermes_home": str(hermes_home) if hermes_home else "",
+            "errors": errors,
+        }
+
     async def _handle_health(self, request: Request) -> Response:
-        """GET /health — simple health check."""
+        """GET /health — health and desktop capability metadata."""
         try:
             from agent.auxiliary_client import get_available_vision_backends
 
@@ -614,12 +742,21 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             vision_backends = []
 
+        metadata = self._collect_capability_metadata()
+
+        try:
+            from hermes_cli import __version__ as hermes_version
+        except Exception:
+            hermes_version = "0.10.0+hermes.local"
+
         return json_response({
             "status": "ok",
             "platform": "hermes-agent",
+            "version": hermes_version,
             "capabilities": {
                 "supports_vision": bool(vision_backends),
                 "vision_backends": vision_backends,
+                **metadata,
             },
         })
 
@@ -1223,7 +1360,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
-        response_id = request.path_params["response_id"]
+        response_id = self._path_param(request, "response_id")
         stored = self._response_store.get(response_id)
         if stored is None:
             return json_response(_openai_error(f"Response not found: {response_id}"), status=404)
@@ -1236,7 +1373,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
-        response_id = request.path_params["response_id"]
+        response_id = self._path_param(request, "response_id")
         deleted = self._response_store.delete(response_id)
         if not deleted:
             return json_response(_openai_error(f"Response not found: {response_id}"), status=404)
@@ -1290,9 +1427,23 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return None
 
+    @staticmethod
+    def _path_param(request: Request, name: str, default: str = "") -> str:
+        """Read a route parameter from FastAPI or the legacy aiohttp request."""
+        params = getattr(request, "path_params", None)
+        if isinstance(params, dict):
+            return str(params.get(name, default))
+        match_info = getattr(request, "match_info", None)
+        if match_info is not None:
+            try:
+                return str(match_info.get(name, default))
+            except AttributeError:
+                pass
+        return default
+
     def _check_job_id(self, request: Request) -> tuple:
         """Validate and extract job_id. Returns (job_id, error_response)."""
-        job_id = request.path_params["job_id"]
+        job_id = self._path_param(request, "job_id")
         if not self._JOB_ID_RE.fullmatch(job_id):
             return job_id, json_response(
                 {"error": "Invalid job ID format"}, status=400,
@@ -1463,7 +1614,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
-        bundle_id = request.path_params.get("bundle_id", "")
+        bundle_id = self._path_param(request, "bundle_id")
         if not bundle_id or not __import__("re").fullmatch(r"[a-f0-9]{12}", bundle_id):
             return json_response({"error": "Invalid bundle ID"}, status=400)
 
@@ -1717,7 +1868,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
-        request_id = request.path_params.get("request_id", "")
+        request_id = self._path_param(request, "request_id")
         pending = self._pending_approvals.get(request_id)
         if not pending:
             return json_response({"error": "No pending approval with this ID"}, status=404)
@@ -2132,7 +2283,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
-        run_id = request.path_params["run_id"]
+        run_id = self._path_param(request, "run_id")
 
         # Allow subscribing slightly before the run is registered (race condition window)
         for _ in range(20):
@@ -2215,6 +2366,127 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.error("Memory Search Failed: %s", e, exc_info=True)
             return json_response(_openai_error(str(e), err_type="server_error"), status=500)
 
+    # ------------------------------------------------------------------
+    # Upgrade Scout API
+    # ------------------------------------------------------------------
+
+    def _upgrade_scout(self):
+        from hermes_cli.upgrade_scout import UpgradeScoutService
+
+        return UpgradeScoutService()
+
+    async def _handle_upgrade_scout_status(self, request: Request) -> Response:
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            return json_response(self._upgrade_scout().status())
+        except Exception as e:
+            logger.error("Upgrade Scout status failed: %s", e, exc_info=True)
+            return json_response(_openai_error(str(e), err_type="server_error"), status=500)
+
+    async def _handle_upgrade_scout_run(self, request: Request) -> Response:
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            return json_response(self._upgrade_scout().run_report(), status=201)
+        except Exception as e:
+            logger.error("Upgrade Scout run failed: %s", e, exc_info=True)
+            return json_response(_openai_error(str(e), err_type="server_error"), status=500)
+
+    async def _handle_upgrade_scout_enable(self, request: Request) -> Response:
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            service = self._upgrade_scout()
+            job = service.ensure_cron_job()
+            report = service.run_report()
+            return json_response({"job": job, "report": report["report"], "brief": report["brief"]}, status=201)
+        except Exception as e:
+            logger.error("Upgrade Scout enable failed: %s", e, exc_info=True)
+            return json_response(_openai_error(str(e), err_type="server_error"), status=500)
+
+    async def _handle_upgrade_scout_pause(self, request: Request) -> Response:
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            return json_response({"job": self._upgrade_scout().pause_cron_job()})
+        except Exception as e:
+            logger.error("Upgrade Scout pause failed: %s", e, exc_info=True)
+            return json_response(_openai_error(str(e), err_type="server_error"), status=500)
+
+    async def _handle_upgrade_scout_reports(self, request: Request) -> Response:
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            return json_response({"reports": self._upgrade_scout().list_reports()})
+        except Exception as e:
+            logger.error("Upgrade Scout reports failed: %s", e, exc_info=True)
+            return json_response(_openai_error(str(e), err_type="server_error"), status=500)
+
+    async def _handle_upgrade_scout_report(self, request: Request) -> Response:
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        report_id = self._path_param(request, "report_id")
+        try:
+            return json_response(self._upgrade_scout().get_report(report_id))
+        except FileNotFoundError:
+            return json_response(_openai_error(f"Report not found: {report_id}"), status=404)
+        except Exception as e:
+            logger.error("Upgrade Scout report failed: %s", e, exc_info=True)
+            return json_response(_openai_error(str(e), err_type="server_error"), status=500)
+
+    async def _handle_upgrade_scout_approve(self, request: Request) -> Response:
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        report_id = self._path_param(request, "report_id")
+        try:
+            return json_response(self._upgrade_scout().approve_report(report_id), status=202)
+        except FileNotFoundError:
+            return json_response(_openai_error(f"Report not found: {report_id}"), status=404)
+        except Exception as e:
+            from hermes_cli.upgrade_scout import DirtyWorktreeError, StaleReportError
+
+            status = 409 if isinstance(e, (DirtyWorktreeError, StaleReportError)) else 500
+            logger.error("Upgrade Scout approval failed: %s", e, exc_info=status == 500)
+            return json_response(
+                _openai_error(str(e), err_type="conflict" if status == 409 else "server_error"),
+                status=status,
+            )
+
+    async def _handle_upgrade_scout_mark_reviewed(self, request: Request) -> Response:
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        report_id = self._path_param(request, "report_id")
+        try:
+            return json_response({"report": self._upgrade_scout().mark_report_reviewed(report_id)})
+        except FileNotFoundError:
+            return json_response(_openai_error(f"Report not found: {report_id}"), status=404)
+        except Exception as e:
+            logger.error("Upgrade Scout mark-reviewed failed: %s", e, exc_info=True)
+            return json_response(_openai_error(str(e), err_type="server_error"), status=500)
+
+    async def _handle_upgrade_scout_apply_run(self, request: Request) -> Response:
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        run_id = self._path_param(request, "run_id")
+        try:
+            run = self._upgrade_scout().get_apply_run(run_id)
+            if not run:
+                return json_response(_openai_error(f"Apply run not found: {run_id}"), status=404)
+            return json_response(run)
+        except Exception as e:
+            logger.error("Upgrade Scout apply-run failed: %s", e, exc_info=True)
+            return json_response(_openai_error(str(e), err_type="server_error"), status=500)
+
     async def _sweep_orphaned_runs(self) -> None:
         """Periodically clean up run streams that were never consumed."""
         while True:
@@ -2276,6 +2548,15 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.add_api_route("/v1/media/synthesize", self._handle_media_synthesize, methods=["POST"])
             self._app.add_api_route("/v1/media/bundles", self._handle_list_bundles, methods=["GET"])
             self._app.add_api_route("/v1/media/bundle/{bundle_id}", self._handle_get_bundle, methods=["GET"])
+            self._app.add_api_route("/api/upgrade-scout/status", self._handle_upgrade_scout_status, methods=["GET"])
+            self._app.add_api_route("/api/upgrade-scout/run", self._handle_upgrade_scout_run, methods=["POST"])
+            self._app.add_api_route("/api/upgrade-scout/enable", self._handle_upgrade_scout_enable, methods=["POST"])
+            self._app.add_api_route("/api/upgrade-scout/pause", self._handle_upgrade_scout_pause, methods=["POST"])
+            self._app.add_api_route("/api/upgrade-scout/reports", self._handle_upgrade_scout_reports, methods=["GET"])
+            self._app.add_api_route("/api/upgrade-scout/reports/{report_id}", self._handle_upgrade_scout_report, methods=["GET"])
+            self._app.add_api_route("/api/upgrade-scout/reports/{report_id}/approve", self._handle_upgrade_scout_approve, methods=["POST"])
+            self._app.add_api_route("/api/upgrade-scout/reports/{report_id}/mark-reviewed", self._handle_upgrade_scout_mark_reviewed, methods=["POST"])
+            self._app.add_api_route("/api/upgrade-scout/apply-runs/{run_id}", self._handle_upgrade_scout_apply_run, methods=["GET"])
 
             # Start background sweep to clean up orphaned runs
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
@@ -2321,6 +2602,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
+            self._app.router.add_post("/v1/audio/transcriptions", self._handle_audio_transcriptions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
@@ -2345,6 +2627,18 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_get("/api/memory/search", self._handle_memory_search)
+            self._app.router.add_post("/v1/media/synthesize", self._handle_media_synthesize)
+            self._app.router.add_get("/v1/media/bundles", self._handle_list_bundles)
+            self._app.router.add_get("/v1/media/bundle/{bundle_id}", self._handle_get_bundle)
+            self._app.router.add_get("/api/upgrade-scout/status", self._handle_upgrade_scout_status)
+            self._app.router.add_post("/api/upgrade-scout/run", self._handle_upgrade_scout_run)
+            self._app.router.add_post("/api/upgrade-scout/enable", self._handle_upgrade_scout_enable)
+            self._app.router.add_post("/api/upgrade-scout/pause", self._handle_upgrade_scout_pause)
+            self._app.router.add_get("/api/upgrade-scout/reports", self._handle_upgrade_scout_reports)
+            self._app.router.add_get("/api/upgrade-scout/reports/{report_id}", self._handle_upgrade_scout_report)
+            self._app.router.add_post("/api/upgrade-scout/reports/{report_id}/approve", self._handle_upgrade_scout_approve)
+            self._app.router.add_post("/api/upgrade-scout/reports/{report_id}/mark-reviewed", self._handle_upgrade_scout_mark_reviewed)
+            self._app.router.add_get("/api/upgrade-scout/apply-runs/{run_id}", self._handle_upgrade_scout_apply_run)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:
