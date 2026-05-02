@@ -1,0 +1,7 @@
+name: summarize
+description: Create a concise, faithful summary of supplied text.
+tags:
+  - writing
+  - analysis
+source: hermes
+license: MIT

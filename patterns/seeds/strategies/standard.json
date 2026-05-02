@@ -1,0 +1,5 @@
+{
+  "name": "standard",
+  "description": "Balanced execution with clear structure and concise reasoning.",
+  "prompt": "Use a balanced, practical style. Give the answer directly, organize it clearly, and include caveats only when they materially affect the result."
+}

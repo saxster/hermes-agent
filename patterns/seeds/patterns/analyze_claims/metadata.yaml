@@ -1,0 +1,7 @@
+name: analyze_claims
+description: Identify, classify, and pressure-test important claims.
+tags:
+  - analysis
+  - critical-thinking
+source: hermes
+license: MIT

@@ -9181,6 +9181,148 @@ Examples:
         logging.getLogger(__name__).debug("Plugin CLI discovery failed: %s", _exc)
 
     # =========================================================================
+    # personal & patterns commands (ported from v0.10 backup)
+    # =========================================================================
+    try:
+        from hermes_cli.cmd_handlers.personal_infra_handler import (
+            cmd_personal,
+            cmd_context,
+            cmd_events,
+            cmd_feedback,
+            cmd_packs,
+        )
+        from hermes_cli.cmd_handlers.patterns_handler import (
+            cmd_patterns,
+            cmd_contexts,
+            cmd_strategies,
+            cmd_ingest,
+        )
+
+        # -- personal
+        _personal_parser = subparsers.add_parser(
+            "personal",
+            help="Initialize, validate, and sync personal Hermes context",
+        )
+        _personal_sub = _personal_parser.add_subparsers(dest="personal_action")
+        _personal_sub.add_parser("init", help="Create missing user/TELOS/project files")
+        _personal_sub.add_parser("doctor", help="Check personal infrastructure paths")
+        _personal_sync = _personal_sub.add_parser("sync-obsidian", help="Mirror personal artifacts into Obsidian")
+        _personal_sync.add_argument("--vault", help="Override configured Obsidian vault path")
+        _personal_parser.set_defaults(func=cmd_personal)
+
+        # -- context
+        _context_parser = subparsers.add_parser("context", help="Inspect assembled Hermes context")
+        _context_sub = _context_parser.add_subparsers(dest="context_action")
+        _context_preview = _context_sub.add_parser("preview", help="Preview bounded personal context")
+        _context_preview.add_argument("--json", action="store_true", help="Emit JSON")
+        _context_preview.add_argument("--tokens", action="store_true", help="Show rough token estimate")
+        _context_parser.set_defaults(func=cmd_context)
+
+        # -- patterns
+        _patterns_parser = subparsers.add_parser("patterns", help="Manage and run lightweight prompt patterns")
+        _patterns_sub = _patterns_parser.add_subparsers(dest="patterns_action")
+        _patterns_sub.add_parser("list", help="List installed patterns")
+        _patterns_sub.add_parser("favorites", help="List favorite pattern names from config")
+        _patterns_show = _patterns_sub.add_parser("show", help="Show a pattern")
+        _patterns_show.add_argument("name")
+        _patterns_import = _patterns_sub.add_parser("import-fabric", help="Import the curated Fabric starter pack")
+        _patterns_import.add_argument("--force", action="store_true", help="Overwrite existing local patterns")
+        _patterns_run = _patterns_sub.add_parser("run", help="Run a pattern")
+        _patterns_run.add_argument("name")
+        _patterns_run.add_argument("input", nargs="?", help="Input text. Reads stdin when omitted and piped.")
+        _patterns_run.add_argument("--context", help="Named context to prepend")
+        _patterns_run.add_argument("--strategy", help="Named strategy to prepend")
+        _patterns_run.add_argument("--variable", action="append", help="Placeholder value as key=value. Repeatable.")
+        _patterns_run.add_argument("--model", help="Model override for this run")
+        _patterns_run.add_argument("--input-ref", help="Ingest artifact id to use as input")
+        _patterns_run.add_argument("--stream", action="store_true", help="Allow streaming display where supported")
+        _patterns_run.add_argument("--output", help="Write final response to a file")
+        _patterns_run.add_argument("--notify", action="store_true", help="Show an OS notification when complete")
+        _patterns_run.add_argument("--render-only", action="store_true", help="Render prompt JSON without executing")
+        _patterns_parser.set_defaults(func=cmd_patterns)
+
+        # -- contexts (pattern contexts)
+        _contexts_parser = subparsers.add_parser("contexts", help="Manage named pattern contexts")
+        _contexts_sub = _contexts_parser.add_subparsers(dest="contexts_action")
+        _contexts_sub.add_parser("list", help="List contexts")
+        _contexts_show = _contexts_sub.add_parser("show", help="Show a context")
+        _contexts_show.add_argument("name")
+        _contexts_create = _contexts_sub.add_parser("create", help="Create a context")
+        _contexts_create.add_argument("name")
+        _contexts_create.add_argument("content", nargs="?", help="Context content. Reads stdin when omitted and piped.")
+        _contexts_delete = _contexts_sub.add_parser("delete", help="Delete a context")
+        _contexts_delete.add_argument("name")
+        _contexts_parser.set_defaults(func=cmd_contexts)
+
+        # -- strategies
+        _strategies_parser = subparsers.add_parser("strategies", help="Inspect pattern strategies")
+        _strategies_sub = _strategies_parser.add_subparsers(dest="strategies_action")
+        _strategies_sub.add_parser("list", help="List strategies")
+        _strategies_show = _strategies_sub.add_parser("show", help="Show a strategy")
+        _strategies_show.add_argument("name")
+        _strategies_parser.set_defaults(func=cmd_strategies)
+
+        # -- ingest
+        _ingest_parser = subparsers.add_parser("ingest", help="Create reusable content artifacts")
+        _ingest_sub = _ingest_parser.add_subparsers(dest="ingest_action")
+        _ingest_youtube = _ingest_sub.add_parser("youtube", help="Ingest a YouTube transcript")
+        _ingest_youtube.add_argument("url")
+        _ingest_youtube.add_argument("--timestamps", action="store_true", help="Preserve transcript timestamps")
+        _ingest_youtube.add_argument("--notify", action="store_true", help="Show an OS notification when complete")
+        _ingest_url = _ingest_sub.add_parser("url", help="Ingest a web URL")
+        _ingest_url.add_argument("url")
+        _ingest_url.add_argument("--notify", action="store_true", help="Show an OS notification when complete")
+        _ingest_file = _ingest_sub.add_parser("file", help="Ingest a local file")
+        _ingest_file.add_argument("path")
+        _ingest_file.add_argument("--notify", action="store_true", help="Show an OS notification when complete")
+        _ingest_clipboard = _ingest_sub.add_parser("clipboard", help="Ingest clipboard text on macOS")
+        _ingest_clipboard.add_argument("--notify", action="store_true", help="Show an OS notification when complete")
+        _ingest_text = _ingest_sub.add_parser("text", help="Ingest literal text")
+        _ingest_text.add_argument("content", nargs="?", help="Text content. Reads stdin when omitted and piped.")
+        _ingest_text.add_argument("--notify", action="store_true", help="Show an OS notification when complete")
+        _ingest_parser.set_defaults(func=cmd_ingest)
+
+        # -- events
+        _events_parser = subparsers.add_parser("events", help="Inspect the typed Hermes event stream")
+        _events_sub = _events_parser.add_subparsers(dest="events_action")
+        _events_tail = _events_sub.add_parser("tail", help="Show recent events")
+        _events_tail.add_argument("--type", help="Filter by event type")
+        _events_tail.add_argument("--limit", type=int, default=100, help="Maximum events")
+        _events_tail.add_argument("--after", type=int, help="Byte offset cursor into events.jsonl")
+        _events_tail.add_argument("--json", action="store_true", help="Emit JSONL")
+        _events_parser.set_defaults(func=cmd_events)
+
+        # -- feedback
+        _feedback_parser = subparsers.add_parser("feedback", help="Capture explicit ratings and failure reports")
+        _feedback_sub = _feedback_parser.add_subparsers(dest="feedback_action")
+        _feedback_rate = _feedback_sub.add_parser("rate", help="Rate a specific assistant response")
+        _feedback_rate.add_argument("--session", required=True, help="Session ID")
+        _feedback_rate.add_argument("--message", required=True, help="Message ID")
+        _feedback_rate.add_argument("--rating", required=True, help="Rating (e.g. 1-10)")
+        _feedback_rate.add_argument("--comment", default="", help="Optional comment")
+        _feedback_fail = _feedback_sub.add_parser("fail", help="Report a failure for a specific message")
+        _feedback_fail.add_argument("--session", required=True, help="Session ID")
+        _feedback_fail.add_argument("--message", required=True, help="Message ID")
+        _feedback_fail.add_argument("--reason", default="", help="Why it failed")
+        _feedback_parser.set_defaults(func=cmd_feedback)
+
+        # -- packs
+        _packs_parser = subparsers.add_parser("packs", help="Manage Hermes content packs")
+        _packs_sub = _packs_parser.add_subparsers(dest="packs_action")
+        _packs_inspect = _packs_sub.add_parser("inspect", help="Preview a pack before installing")
+        _packs_inspect.add_argument("path_or_url", help="Local path or remote URL")
+        _packs_install = _packs_sub.add_parser("install", help="Install a pack")
+        _packs_install.add_argument("path_or_url", help="Local path or remote URL")
+        _packs_install.add_argument("--dry-run", action="store_true", help="Preview changes")
+        _packs_install.add_argument("--backup", action="store_true", help="Backup existing files first")
+        _packs_sub.add_parser("list", help="List installed packs")
+        _packs_remove = _packs_sub.add_parser("remove", help="Remove an installed pack")
+        _packs_remove.add_argument("path_or_url", help="Pack name or path")
+        _packs_parser.set_defaults(func=cmd_packs)
+    except Exception as _exc:
+        logging.getLogger(__name__).debug("Personal/patterns CLI wiring failed: %s", _exc)
+
+    # =========================================================================
     # curator command — background skill maintenance
     # =========================================================================
     curator_parser = subparsers.add_parser(

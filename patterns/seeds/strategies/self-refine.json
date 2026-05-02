@@ -1,0 +1,5 @@
+{
+  "name": "self-refine",
+  "description": "Draft, check, and improve before answering.",
+  "prompt": "Before finalizing, silently check whether the output misses key evidence, overclaims, or can be made clearer. Return only the improved final answer."
+}

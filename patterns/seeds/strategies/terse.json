@@ -1,0 +1,5 @@
+{
+  "name": "terse",
+  "description": "Short, high-signal output.",
+  "prompt": "Be terse and high-signal. Prefer compact bullets or short paragraphs. Omit background unless it changes the answer."
+}

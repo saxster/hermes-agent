@@ -1,0 +1,7 @@
+name: extract_wisdom
+description: Extract durable lessons, mental models, and practical takeaways.
+tags:
+  - wisdom
+  - notes
+source: hermes
+license: MIT
