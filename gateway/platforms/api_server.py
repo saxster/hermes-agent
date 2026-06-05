@@ -1029,14 +1029,52 @@ class APIServerAdapter(BasePlatformAdapter):
                     "status": "completed",
                 }))
 
+            def _on_progress(*args, **kwargs):
+                """Relay DELEGATION progress as ``hermes.delegate.progress`` so
+                frontends can render the live subagent tree (parity with the
+                CLI's delegation spinner).
+
+                Regular parent tool progress is ignored here — it is already
+                covered by ``tool_start_callback``/``tool_complete_callback`` with
+                richer per-call ids, so this callback only forwards events that
+                carry delegation identity (``subagent_id`` / ``subagent.*``),
+                preserving the no-duplication invariant while filling the gap.
+                """
+                event_type = args[0] if args else kwargs.get("event_type")
+                if not isinstance(event_type, str):
+                    return
+                subagent_id = kwargs.get("subagent_id")
+                if subagent_id is None and not event_type.startswith("subagent"):
+                    return
+                node_id = subagent_id or kwargs.get("task_id") or kwargs.get("agent_id")
+                if node_id is None:
+                    return  # the client reducer keys the tree by id
+                if event_type == "subagent.complete":
+                    status = "done"
+                elif "error" in event_type:
+                    status = "error"
+                else:
+                    status = "running"
+                tool_name = args[1] if len(args) > 1 else kwargs.get("tool_name")
+                preview = args[2] if len(args) > 2 else kwargs.get("preview")
+                _stream_q.put(("__delegate_progress__", {
+                    "id": node_id,
+                    "parent_id": kwargs.get("parent_id"),
+                    "goal": kwargs.get("goal"),
+                    "status": status,
+                    "depth": kwargs.get("depth"),
+                    "tool": tool_name,
+                    "label": preview or kwargs.get("goal"),
+                }))
+
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
             #
-            # ``tool_progress_callback`` is intentionally not wired here:
-            # it would duplicate every emit because ``run_agent`` fires it
-            # side-by-side with ``tool_start_callback``/``tool_complete_callback``.
-            # The structured callbacks are strictly richer (they carry the
-            # tool_call id), so they own the chat-completions SSE channel.
+            # ``tool_progress_callback`` is wired ONLY for delegation events (see
+            # ``_on_progress``): regular tool progress stays on the richer
+            # ``tool_start_callback``/``tool_complete_callback`` channel, so there
+            # is no duplication — delegation events would otherwise be lost on the
+            # chat-completions stream.
             agent_ref = [None]
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
@@ -1044,6 +1082,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
+                tool_progress_callback=_on_progress,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
@@ -1167,6 +1206,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     event_data = json.dumps(item[1])
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
+                    )
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__delegate_progress__":
+                    # Live subagent-tree node for delegation-aware frontends.
+                    event_data = json.dumps(item[1])
+                    await response.write(
+                        f"event: hermes.delegate.progress\ndata: {event_data}\n\n".encode()
                     )
                 else:
                     content_chunk = {
