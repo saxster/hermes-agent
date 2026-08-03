@@ -75,3 +75,8 @@ auth.lock
 dist/
 graphify-out/
 .playwright-mcp/
+sessions/
+state.db
+models_dev_cache.json
+test_final_output.log
+cron/jobs.json
