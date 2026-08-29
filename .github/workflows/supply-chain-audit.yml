@@ -1,17 +1,8 @@
 name: Supply Chain Audit
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths:
-      - '**/*.py'
-      - '**/*.pth'
-      - '**/setup.py'
-      - '**/setup.cfg'
-      - '**/sitecustomize.py'
-      - '**/usercustomize.py'
-      - '**/__init__.pth'
-
+  push:
+    branches: [main]
 permissions:
   pull-requests: write
   contents: read
